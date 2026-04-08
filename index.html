@@ -297,9 +297,50 @@
   .dias-wrap{display:flex;gap:6px;flex-wrap:wrap;}
   .dia-btn{width:38px;height:38px;border-radius:50%;border:1.5px solid var(--border);background:transparent;cursor:pointer;font-size:12px;font-weight:600;color:var(--text-muted);font-family:'DM Sans',sans-serif;transition:all 0.15s;}
   .dia-btn.on{background:var(--accent);color:#fff;border-color:var(--accent);}
+  /* ═══ RESPONSIVIDADE MOBILE ═══ */
+  @media(max-width:1024px){
+    .stats-grid,.comercial-grid,.report-stats{grid-template-columns:repeat(2,1fr);}
+    .dashboard-grid{grid-template-columns:1fr;}
+    .charts-row{grid-template-columns:1fr;}
+    .prontuario-layout{grid-template-columns:1fr;}
+    .wa-layout{grid-template-columns:1fr;grid-template-rows:auto 1fr;}
+  }
+  @media(max-width:768px){
+    .sidebar{position:fixed;left:-260px;z-index:90;height:100vh;transition:left 0.3s ease;box-shadow:var(--shadow-lg);}
+    .sidebar.open{left:0;}
+    .sidebar-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:89;}
+    .sidebar-overlay.open{display:block;}
+    body{flex-direction:column;}
+    .main{width:100%;}
+    .topbar{padding:0 12px;gap:8px;}
+    .topbar::before{content:'☰';font-size:22px;cursor:pointer;padding:6px;margin-right:2px;}
+    .search-box{width:140px;}
+    .content{padding:14px;}
+    .stats-grid,.comercial-grid,.report-stats{grid-template-columns:1fr;}
+    .kanban-board{flex-direction:column;}
+    .kanban-col{width:100%;}
+    .wa-layout{grid-template-columns:1fr;height:auto;min-height:calc(100vh - 165px);}
+    .wa-sidebar{max-height:250px;border-right:none;border-bottom:1px solid var(--border);}
+    .info-grid{grid-template-columns:1fr;}
+    .drawer{width:100vw;right:-100vw;}
+    .modal{width:95vw;max-width:520px;}
+    .ai-chip span:not(.ai-dot){display:none;}
+    .btn-primary span.btn-text{display:none;}
+    .agenda-layout .kanban-board{overflow-x:auto;}
+  }
+  @media(max-width:480px){
+    .topbar-title{font-size:16px;}
+    .search-box{display:none;}
+    .stat-value,.comercial-value{font-size:22px;}
+    .comercial-grid{gap:8px;}
+    .patients-table{font-size:12px;}
+    .patients-table th,.patients-table td{padding:8px 10px;}
+    .patient-avatar{width:28px;height:28px;font-size:10px;}
+  }
 </style>
 </head>
 <body>
+<div class="sidebar-overlay" id="sidebar-overlay" onclick="document.querySelector('.sidebar').classList.remove('open');this.classList.remove('open')"></div>
 
 <aside class="sidebar">
   <div class="sidebar-logo">
@@ -803,7 +844,7 @@
       <div style="display:grid;grid-template-columns:1fr 300px;gap:20px;height:calc(100vh - 220px)">
         <div class="card" style="display:flex;flex-direction:column;overflow:hidden">
           <div class="card-header"><span>✦</span><span class="card-title">Chat com o Agente</span><span style="font-size:12px;color:var(--text-muted)">claude-sonnet-4</span></div>
-          <div id="agent-messages"><div style="align-self:flex-start;max-width:70%;background:var(--surface);border:1px solid var(--border);border-radius:10px;border-bottom-left-radius:3px;padding:12px 14px;font-size:13.5px;line-height:1.6;box-shadow:0 1px 3px rgba(0,0,0,0.05)"><div style="font-size:11px;color:var(--accent);font-weight:600;margin-bottom:5px">✦ Agente Barakat Awada</div>Olá! Sou o agente da Barakat Awada, integrado com os dados do Dr. Ali Mohamed, Dra. Jamile e Dra. Soraia. Como posso ajudar?</div></div>
+          <div id="agent-messages"><div style="align-self:flex-start;max-width:70%;background:var(--surface);border:1px solid var(--border);border-radius:10px;border-bottom-left-radius:3px;padding:12px 14px;font-size:13.5px;line-height:1.6;box-shadow:0 1px 3px rgba(0,0,0,0.05)"><div style="font-size:11px;color:var(--accent);font-weight:600;margin-bottom:5px">✦ Assistente Barakat Awada</div>Olá! Sou o assistente da Barakat Awada, integrado com os dados do Dr. Ali Mohamed, Dra. Jamile e Dra. Soraia. Como posso ajudar?</div></div>
           <div style="padding:12px 14px;border-top:1px solid var(--border);display:flex;gap:8px;background:var(--surface)"><input id="agent-input" class="form-input" style="flex:1;background:var(--bg)" placeholder="Pergunte sobre pacientes, agenda..."><button class="btn btn-primary" onclick="sendAgentMessage()">Enviar ✦</button></div>
         </div>
         <div style="display:flex;flex-direction:column;gap:12px">
@@ -1717,6 +1758,9 @@ function navigate(page,navEl){
   if(page==='pacientes')carregarPacientes();
   if(page==='config'){ carregarTelaConfig(); setTimeout(()=>{ carregarIntegracoes(); carregarAgenteConfig(); }, 50); }
   if(page==='whatsapp') setTimeout(carregarChatsWA, 50);
+  // Fecha sidebar no mobile
+  document.querySelector('.sidebar')?.classList.remove('open');
+  document.getElementById('sidebar-overlay')?.classList.remove('open');
 }
 
 // ══════════════════════════════════════════════
@@ -2160,7 +2204,22 @@ async function _autoResponderWA(chatId, textoRecebido, allMsgs){
   // System prompt do agente
   const hoje = new Date().toLocaleDateString('pt-BR',{weekday:'long',day:'2-digit',month:'long'});
   const systemPrompt = promptCustom ||
-    `Você é ${nomeAgente}, assistente virtual da ${clinica}. Atenda pacientes pelo WhatsApp com gentileza e profissionalismo. Hoje é ${hoje}. Responda de forma curta e direta (máximo 3 parágrafos). Nunca dê diagnósticos ou orientações médicas. Quando o paciente quiser agendar, pergunte nome, data preferida e se é presencial ou online.`;
+    `Você é ${nomeAgente}, secretária virtual da Clínica Barakat Awada, especializada em Urologia e Clínica Geral. Hoje é ${hoje}.
+
+EQUIPE MÉDICA:
+- Dr. Ali Mohamed — Urologista
+- Dra. Jamile Barakat — Urologista
+- Dra. Soraia Barakat — Clínica Geral
+
+REGRAS:
+- Seja acolhedora, empática e profissional
+- Responda de forma curta e direta (máximo 2 parágrafos)
+- NUNCA dê diagnósticos, prescrições ou orientações médicas
+- Para agendar: pergunte nome completo, data/horário preferido, se tem convênio, e com qual profissional deseja consultar
+- Procedimentos urológicos (exames, cirurgias, biópsia): encaminhe para a recepção
+- Urgências: oriente procurar pronto-socorro imediatamente
+- Horário de atendimento: segunda a sexta, 8h às 18h
+- Aceita particular e convênios`;
 
   try {
     const resp = await fetch('https://api.anthropic.com/v1/messages', {
@@ -2878,11 +2937,14 @@ async function sendAgentMessage(){
   }catch(e){ /* sem banco, continua */ }
 
   const clinica = getClinicaNome();
-  const nomeAgente = cfg.nome || 'Agente Barakat Awada';
+  const nomeAgente = cfg.nome || 'Assistente Barakat Awada';
   const systemPrompt = promptCustom ||
-    `Você é ${nomeAgente} da ${clinica}, clínica de urologia e clínica geral em São Paulo. Responda em português, de forma concisa e profissional.
+    `Você é ${nomeAgente} da ${clinica}, clínica especializada em Urologia e Clínica Geral.
+Equipe: Dr. Ali Mohamed (Urologista), Dra. Jamile Barakat (Urologista), Dra. Soraia Barakat (Clínica Geral).
 Hoje: ${hoje}. Agenda: ${agendaStr}. Total: ${nAtivos} pacientes ativos, ${nLeads} leads no pipeline.
-Você tem acesso a dados de pacientes, agenda e pipeline. Responda com base nesses dados quando possível.`;
+Você tem acesso a dados de pacientes, agenda e pipeline. Responda com base nesses dados quando possível.
+Quando perguntarem sobre métricas, analise os números e dê insights acionáveis.
+Responda em português, de forma concisa e profissional.`;
 
   // Mantém histórico da conversa no painel
   _agentChatHistory.push({ role:'user', content: msg });
@@ -2911,7 +2973,7 @@ function addAgentMessage(text,role,isLoading=false){
   const el=document.createElement('div');
   const isUser=role==='user';
   el.style.cssText=`align-self:${isUser?'flex-end':'flex-start'};max-width:75%;background:${isUser?'var(--accent)':'var(--surface)'};color:${isUser?'#fff':'var(--text)'};border:${isUser?'none':'1px solid var(--border)'};border-radius:10px;border-${isUser?'bottom-right':'bottom-left'}-radius:3px;padding:12px 14px;font-size:13.5px;line-height:1.6;box-shadow:0 1px 3px rgba(0,0,0,0.05)`;
-  if(!isUser){const lbl=document.createElement('div');lbl.style.cssText='font-size:11px;color:var(--accent);font-weight:600;margin-bottom:5px';lbl.textContent='✦ Agente Barakat Awada';el.appendChild(lbl);}
+  if(!isUser){const lbl=document.createElement('div');lbl.style.cssText='font-size:11px;color:var(--accent);font-weight:600;margin-bottom:5px';lbl.textContent='✦ Assistente Barakat Awada';el.appendChild(lbl);}
   const cnt=document.createElement('div');cnt.textContent=isLoading?'...':text;if(isLoading)cnt.style.cssText='animation:pulse 1s infinite;color:var(--text-muted)';
   el.appendChild(cnt);c.appendChild(el);c.scrollTop=c.scrollHeight;return el;
 }
@@ -5387,6 +5449,13 @@ window.addEventListener('load', () => {
   carregarPacientes();
   carregarKanban();
   carregarMetricasDashboard();
+});
+// Mobile sidebar toggle
+document.addEventListener('click', function(e){
+  if(window.innerWidth <= 768 && e.target.closest('.topbar') && e.pageX < 60){
+    document.querySelector('.sidebar').classList.toggle('open');
+    document.getElementById('sidebar-overlay').classList.toggle('open');
+  }
 });
 </script>
 </body>
