@@ -2810,45 +2810,36 @@ async function transcreverAudioWhisper(audioBlob, mimeType){
 }
 
 async function _waBaixarMidiaUAZAPI(msgObj){
-  // Tenta baixar a mídia da mensagem via endpoint da UAZAPI
-  const url = _waApiUrl();
-  const tok = _waApiToken();
-  const msgId = msgObj.messageid || msgObj.id;
-  if(!msgId) return null;
+  // UAZAPI já converte o áudio/imagem e disponibiliza em fileURL (ex: .../files/xxx.mp3)
+  // Essa é a forma mais simples e confiável de baixar mídia.
   try {
-    // Endpoint UAZAPI para download de mídia
-    const r = await fetch(`${url}/message/download`, {
-      method:'POST',
-      headers:{'Content-Type':'application/json','token':tok},
-      body: JSON.stringify({ messageid: msgId })
-    });
-    if(!r.ok){
-      // Fallback: tenta URL direta se existir
-      const directUrl = msgObj.content?.audioMessage?.url || msgObj.content?.imageMessage?.url || msgObj.fileURL;
-      if(directUrl){
-        const r2 = await fetch(directUrl);
-        if(r2.ok) return await r2.blob();
+    // 1) fileURL direto (preferencial — UAZAPI já descriptografou e hospedou)
+    const fileURL = msgObj.fileURL;
+    if(fileURL){
+      const r = await fetch(fileURL);
+      if(r.ok){
+        const blob = await r.blob();
+        console.log('[Mídia] Baixada via fileURL:', fileURL, 'size:', blob.size);
+        return blob;
       }
-      return null;
+      console.warn('[Mídia] fileURL não ok:', r.status, fileURL);
     }
-    // UAZAPI retorna ou blob direto ou {url, base64}
-    const ct = r.headers.get('content-type') || '';
-    if(ct.includes('application/json')){
-      const data = await r.json();
-      if(data.base64){
-        // converte base64 → blob
-        const byteChars = atob(data.base64);
-        const byteNums = new Array(byteChars.length);
-        for(let i=0;i<byteChars.length;i++) byteNums[i] = byteChars.charCodeAt(i);
-        return new Blob([new Uint8Array(byteNums)], { type: data.mimetype || 'application/octet-stream' });
-      }
-      if(data.url){
-        const r2 = await fetch(data.url);
-        return r2.ok ? await r2.blob() : null;
-      }
-      return null;
+    // 2) content.URL (WhatsApp criptografado — normalmente não funciona sem mediaKey)
+    const contentURL = msgObj.content?.URL || msgObj.content?.url;
+    if(contentURL){
+      try {
+        const r = await fetch(contentURL);
+        if(r.ok){
+          const blob = await r.blob();
+          if(blob.size > 100){
+            console.log('[Mídia] Baixada via content.URL');
+            return blob;
+          }
+        }
+      } catch(e){ /* CORS/criptografado — ignora */ }
     }
-    return await r.blob();
+    console.warn('[Mídia] Não foi possível baixar. Msg:', msgObj.messageType, 'fileURL:', fileURL);
+    return null;
   } catch(e){
     console.error('[Mídia] Erro ao baixar:', e);
     return null;
