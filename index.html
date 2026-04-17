@@ -1829,6 +1829,7 @@ let _waLastMsgTs     = {};   // chatId -> timestamp da última msg vista (para d
 let _waConvHistory   = {};   // chatId -> [{role:'user'|'assistant', content}] histórico para o Claude
 let _waAgentBusy     = {};   // chatId -> true enquanto o agente está processando (evita duplas)
 let _waMsgsRespondidas = new Set();  // msgId -> já respondida (dedupe anti-race)
+let _waAgentLocks    = {};   // chatId -> Promise em andamento (serializa execuções por chat)
 let _waAgentGlobal   = false; // modo global: responde TODAS as conversas automaticamente
 let _waGlobalTimer   = null;  // intervalo de polling global (verifica todos os chats)
 
@@ -2039,6 +2040,7 @@ async function _waPollingCheck(){
         const tsUltima = ultima.messageTimestamp || ultima.ts || 0;
         const tsSalvo  = _waLastMsgTs[chatId] || 0;
         // Nova mensagem recebida (não enviada por nós) e mais recente que a última salva
+        let _retryLater = false;
         if(!ultima.fromMe && tsUltima > tsSalvo && tsSalvo > 0){
           // Usa lógica centralizada: agente individual ON
           if(_waAgenteAtivoParaChat(chatId) && !_waAgentBusy[chatId]){
@@ -2046,7 +2048,11 @@ async function _waPollingCheck(){
             const msgId = ultima.messageid || ultima.id || `${chatId}-${tsUltima}`;
             if(!_waMsgsRespondidas.has(msgId)){
               const multimodalContent = await _extrairConteudoMsg(ultima);
-              if(multimodalContent && !(typeof multimodalContent === 'object' && multimodalContent.__retryLater)){
+              // Se extrator pediu retry (ex: áudio ainda processando), NÃO marca nem atualiza ts
+              if(multimodalContent && typeof multimodalContent === 'object' && multimodalContent.__retryLater){
+                console.log('[Polling] Áudio ainda processando. Retry no próximo ciclo.');
+                _retryLater = true;
+              } else if(multimodalContent){
                 // Trava síncrona + marca msgId
                 _waAgentBusy[chatId] = true;
                 _waMsgsRespondidas.add(msgId);
@@ -2055,8 +2061,8 @@ async function _waPollingCheck(){
             }
           }
         }
-        // Atualiza o timestamp da última msg vista
-        if(tsUltima > tsSalvo) _waLastMsgTs[chatId] = tsUltima;
+        // Atualiza o timestamp da última msg vista (exceto quando aguardando retry)
+        if(!_retryLater && tsUltima > tsSalvo) _waLastMsgTs[chatId] = tsUltima;
       } else if(msgs.length){
         // Agente global ligado — só atualiza timestamp, não dispara (global cuida)
         const ultima = msgs[msgs.length - 1];
@@ -2437,11 +2443,11 @@ async function _agenteGetPacienteByChat(chatId){
 }
 
 // Executor das tools
-async function _agenteExecutarTool(nomeTool, args, chatId){
+async function _agenteExecutarTool(nomeTool, args, chatId, ctx){
   try {
-    const chat = _waChatsCache?.find(c => c.id === chatId);
-    const telefone = (chat?.phone || chat?.wa_chatid || '').replace(/\D/g,'');
-    let paciente = await _agenteGetPacienteByChat(chatId);
+    const chat = ctx?.chat || _waChatsCache?.find(c => c.id === chatId);
+    const telefone = ctx?.telefone || (chat?.phone || chat?.wa_chatid || '').replace(/\D/g,'');
+    let paciente = ctx?.paciente !== undefined ? ctx.paciente : await _agenteGetPacienteByChat(chatId);
 
     // ── CRIAR PACIENTE ─────────────────────
     if(nomeTool === 'criar_paciente'){
@@ -2964,6 +2970,17 @@ async function _extrairConteudoMsg(msgObj){
 
 // ── Auto-Responder IA (com Tool Use) ──────────────────────────
 async function _autoResponderWA(chatId, textoRecebido, allMsgs){
+  // Se já há uma execução em andamento para este chat, AGUARDA ela terminar
+  // (evita race condition entre múltiplos pollings)
+  if(_waAgentLocks[chatId]){
+    console.log('[Agente] Aguardando lock anterior para', chatId);
+    try { await _waAgentLocks[chatId]; } catch(e){}
+  }
+  // Cria novo lock
+  let _lockResolve;
+  _waAgentLocks[chatId] = new Promise(resolve => { _lockResolve = resolve; });
+
+  try {
   // Nota: o polling já setou _waAgentBusy[chatId]=true de forma SÍNCRONA antes de nos chamar.
   // Mas se for chamado por outro caminho (ex: abrir chat manualmente), garantimos aqui também.
   if(!_waAgentBusy[chatId]) _waAgentBusy[chatId] = true;
@@ -2971,6 +2988,17 @@ async function _autoResponderWA(chatId, textoRecebido, allMsgs){
   const hasAnthropic = !!getAnthropicKey();
   const hasOpenAI = !!getOpenAIKey();
   if(!hasAnthropic && !hasOpenAI){ _waAgentBusy[chatId] = false; return; }
+
+  // ⬇️ Captura SÍNCRONA do chat/phone ANTES de qualquer await (evita race entre chats) ⬇️
+  const _chatSnapshot = _waChatsCache?.find(c => c.id === chatId);
+  const _phoneSnapshot = _waFmtPhone(_chatSnapshot?.phone || _chatSnapshot?.wa_chatid || '');
+  const _telefoneChat = (_chatSnapshot?.phone || _chatSnapshot?.wa_chatid || '').replace(/\D/g,'');
+  const _nomeWAChat = _chatSnapshot?.name || _chatSnapshot?.wa_contactName || '';
+  if(!_phoneSnapshot){
+    console.warn('[Agente] Chat sem phone no cache:', chatId);
+    _waAgentBusy[chatId] = false;
+    return;
+  }
 
   // Monta histórico de conversa
   if(!_waConvHistory[chatId]) _waConvHistory[chatId] = [];
@@ -3003,9 +3031,9 @@ async function _autoResponderWA(chatId, textoRecebido, allMsgs){
 
   // Contexto: paciente já existe? + fallback para nome do WhatsApp
   const pacienteExistente = await _agenteGetPacienteByChat(chatId);
-  const chatDaConversa = _waChatsCache?.find(c => c.id === chatId);
-  const telefoneChat = (chatDaConversa?.phone || chatDaConversa?.wa_chatid || '').replace(/\D/g,'');
-  const nomeWhatsApp = chatDaConversa?.name || chatDaConversa?.wa_contactName || '';
+  const chatDaConversa = _chatSnapshot;
+  const telefoneChat = _telefoneChat;
+  const nomeWhatsApp = _nomeWAChat;
 
   // Nome definitivo para esta conversa (ordem de prioridade)
   let nomeDefinitivo = '';
@@ -3022,6 +3050,10 @@ async function _autoResponderWA(chatId, textoRecebido, allMsgs){
   }
 
   const contextoPaciente = `
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⛔⛔⛔ NOME DA PESSOA COM QUEM VOCÊ ESTÁ FALANDO AGORA: ${nomeDefinitivo || 'A SER IDENTIFICADO'} ⛔⛔⛔
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 ╔═══════════════════════════════════════════════════════════════╗
 ║  🔒 IDENTIDADE DESTA CONVERSA (INEGOCIÁVEL)                   ║
@@ -3167,7 +3199,9 @@ FLUXO IDEAL:
 REGRAS DE AGENDAMENTO:
 - NUNCA invente horários. SEMPRE consulte listar_horarios_disponiveis antes.
 - Cada consulta dura 30 minutos por padrão.
-- Atendimento: segunda a sexta, 8h às 18h. Sem atendimento em fim de semana.${contextoPaciente}`;
+- Atendimento: segunda a sexta, 8h às 18h. Sem atendimento em fim de semana.${contextoPaciente}
+
+🔒🔒🔒 LEMBRETE FINAL: Esta conversa é com ${nomeDefinitivo || 'pessoa ainda não identificada'}. Use APENAS esse nome. NUNCA "Camilo", "Vicente", "Ale", ou qualquer outro nome de outra conversa. 🔒🔒🔒`;
 
   // Loop de tool use (permite múltiplas chamadas em sequência)
   let textoResposta = '';
@@ -3198,7 +3232,11 @@ REGRAS DE AGENDAMENTO:
         const toolResults = [];
         for(const tc of aiResult.toolCalls){
           console.log('[Tool] Executando:', tc.name, tc.input);
-          const resultado = await _agenteExecutarTool(tc.name, tc.input, chatId);
+          const resultado = await _agenteExecutarTool(tc.name, tc.input, chatId, {
+            chat: _chatSnapshot,
+            telefone: _telefoneChat,
+            paciente: pacienteExistente
+          });
           toolResults.push({
             type: 'tool_result',
             tool_use_id: tc.id,
@@ -3262,19 +3300,27 @@ REGRAS DE AGENDAMENTO:
     await new Promise(r => setTimeout(r, 800 + Math.random()*700));
 
     // Envia pelo WhatsApp
-    await _waEnviarRespostaAgente(chatId, textoResposta);
+    await _waEnviarRespostaAgente(chatId, textoResposta, _phoneSnapshot);
 
   } catch(e){
     console.error('[Agente IA] Erro:', e);
   }
   _waAgentBusy[chatId] = false;
+  } finally {
+    // Sempre libera o lock, mesmo em caso de erro não capturado
+    _waAgentBusy[chatId] = false;
+    try { _lockResolve && _lockResolve(); } catch(e){}
+    delete _waAgentLocks[chatId];
+  }
 }
 
-async function _waEnviarRespostaAgente(chatId, texto){
-  const chat = _waChatsCache.find(c=>c.id===chatId);
-  if(!chat) return;
-  const phone = _waFmtPhone(chat.phone || chat.wa_chatid || '');
-  if(!phone) return;
+async function _waEnviarRespostaAgente(chatId, texto, phoneOverride){
+  let phone = phoneOverride;
+  if(!phone){
+    const chat = _waChatsCache.find(c=>c.id===chatId);
+    phone = _waFmtPhone(chat?.phone || chat?.wa_chatid || '');
+  }
+  if(!phone){ console.warn('[Agente] Sem phone para', chatId); return; }
   const url = _waApiUrl(); const tok = _waApiToken();
   try {
     const r = await fetch(`${url}/send/text`, {
