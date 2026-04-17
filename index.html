@@ -2243,6 +2243,31 @@ const _AGENTE_TOOLS = [
     }
   },
   {
+    name: 'consultar_agenda',
+    description: 'Consulta a agenda de consultas em um intervalo de datas. Use SEMPRE antes de propor um horário para o paciente, para evitar conflitos. Retorna lista de consultas já agendadas.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        data_inicio: { type: 'string', description: 'Data inicial YYYY-MM-DD (ex: 2026-04-20)' },
+        data_fim: { type: 'string', description: 'Data final YYYY-MM-DD (ex: 2026-04-26). Para 1 dia, use a mesma data.' },
+        profissional: { type: 'string', description: 'Filtrar por profissional (Ali/Jamile/Soraia) ou deixe vazio para todos' },
+      },
+      required: ['data_inicio','data_fim']
+    }
+  },
+  {
+    name: 'listar_horarios_disponiveis',
+    description: 'Retorna horários LIVRES de um profissional num dia específico. Use quando o paciente perguntar "que horas tem disponível?". Considera horário comercial 8h-18h e duração de 30min por slot.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        data: { type: 'string', description: 'Data YYYY-MM-DD' },
+        profissional: { type: 'string', description: 'Nome do profissional (Ali/Jamile/Soraia)' },
+      },
+      required: ['data','profissional']
+    }
+  },
+  {
     name: 'marcar_perdido',
     description: 'Marca o lead como perdido quando o paciente desiste, cancela sem remarcar, ou demonstra claramente que não tem interesse.',
     input_schema: {
@@ -2380,6 +2405,74 @@ async function _agenteExecutarTool(nomeTool, args, chatId){
       return { ok:true, mensagem:'Nota registrada na timeline' };
     }
 
+    // ── CONSULTAR AGENDA ───────────────────
+    if(nomeTool === 'consultar_agenda'){
+      const ini = `${args.data_inicio}T00:00:00`;
+      const fim = `${args.data_fim}T23:59:59`;
+      let q = sb.from('consultas')
+        .select('data_hora_inicio, data_hora_fim, tipo, modalidade, status, profissionais(nome,titulo,inicial), pacientes(nome,sobrenome)')
+        .gte('data_hora_inicio', ini)
+        .lte('data_hora_inicio', fim)
+        .neq('status','cancelada')
+        .order('data_hora_inicio', {ascending:true});
+      if(args.profissional){
+        const profId = _agenteResolveProfissional(args.profissional);
+        if(profId) q = q.eq('profissional_id', profId);
+      }
+      const { data: consultas, error } = await q;
+      if(error) return { ok:false, mensagem:'Erro: ' + error.message };
+      const lista = (consultas||[]).map(c => {
+        const dt = new Date(c.data_hora_inicio);
+        const fimDt = new Date(c.data_hora_fim);
+        const pac = c.pacientes ? `${c.pacientes.nome} ${c.pacientes.sobrenome}` : '—';
+        const prof = c.profissionais ? `${c.profissionais.titulo} ${c.profissionais.nome}` : '—';
+        return {
+          data: dt.toLocaleDateString('pt-BR'),
+          hora_inicio: dt.toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}),
+          hora_fim: fimDt.toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}),
+          paciente: pac, profissional: prof,
+          tipo: c.tipo, modalidade: c.modalidade, status: c.status
+        };
+      });
+      return { ok:true, total: lista.length, consultas: lista, mensagem: lista.length ? `${lista.length} consultas no período` : 'Nenhuma consulta no período' };
+    }
+
+    // ── LISTAR HORÁRIOS DISPONÍVEIS ────────
+    if(nomeTool === 'listar_horarios_disponiveis'){
+      const profId = _agenteResolveProfissional(args.profissional);
+      if(!profId) return { ok:false, mensagem:`Profissional "${args.profissional}" não encontrado.` };
+      const ini = `${args.data}T00:00:00`;
+      const fim = `${args.data}T23:59:59`;
+      const { data: ocupados } = await sb.from('consultas')
+        .select('data_hora_inicio, data_hora_fim')
+        .eq('profissional_id', profId)
+        .gte('data_hora_inicio', ini).lte('data_hora_inicio', fim)
+        .neq('status','cancelada');
+      // Verifica dia da semana — não atende sábado/domingo
+      const diaSemana = new Date(args.data+'T12:00:00').getDay();
+      if(diaSemana === 0 || diaSemana === 6){
+        return { ok:true, mensagem:'Clínica não atende em fins de semana', horarios_livres: [] };
+      }
+      // Gera slots de 30min entre 8h e 18h
+      const slots = [];
+      for(let h=8; h<18; h++){
+        for(let m=0; m<60; m+=30){
+          const dt = new Date(`${args.data}T${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:00`);
+          const dtFim = new Date(dt.getTime() + 30*60000);
+          // Verifica conflito
+          const conflita = (ocupados||[]).some(o => {
+            const oIni = new Date(o.data_hora_inicio);
+            const oFim = new Date(o.data_hora_fim);
+            return dt < oFim && dtFim > oIni;
+          });
+          if(!conflita){
+            slots.push(`${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`);
+          }
+        }
+      }
+      return { ok:true, data: args.data, profissional: args.profissional, horarios_livres: slots, total: slots.length, mensagem: slots.length ? `${slots.length} horários disponíveis` : 'Nenhum horário disponível neste dia' };
+    }
+
     // ── MARCAR PERDIDO ─────────────────────
     if(nomeTool === 'marcar_perdido'){
       if(!paciente) return { ok:false, mensagem:'Paciente não encontrado.' };
@@ -2482,16 +2575,24 @@ REGRAS:
 FERRAMENTAS DISPONÍVEIS (use sempre que fizer sentido):
 1. criar_paciente — quando for um lead novo com nome identificado
 2. mover_estagio_pipeline — quando houver mudança clara (Novo Lead → Contato Feito → Agendado → Ativo → Alta)
-3. agendar_consulta — SOMENTE quando paciente confirmar data, hora e profissional específicos
-4. registrar_nota — para informações importantes (preferências, observações relevantes)
-5. marcar_perdido — quando paciente desistir claramente
-6. transferir_para_humano — para urgências médicas ou quando pedir humano
+3. consultar_agenda — para ver consultas já marcadas em um período
+4. listar_horarios_disponiveis — SEMPRE use ANTES de propor horários (verifica vagas livres)
+5. agendar_consulta — SOMENTE quando paciente confirmar data, hora e profissional específicos
+6. registrar_nota — para informações importantes (preferências, observações relevantes)
+7. marcar_perdido — quando paciente desistir claramente
+8. transferir_para_humano — para urgências médicas ou quando pedir humano
 
 FLUXO IDEAL:
 1. Primeira mensagem → pergunte nome → use criar_paciente → mova para "Contato Feito"
-2. Interesse em agendar → colete data/hora/profissional/modalidade → use agendar_consulta (move auto para "Agendado")
-3. Urgência médica → use transferir_para_humano(urgente=true)
-4. Execute tools em silêncio e depois responda ao paciente naturalmente.${contextoPaciente}`;
+2. Paciente quer agendar → use listar_horarios_disponiveis → ofereça opções → confirme com paciente → use agendar_consulta (move auto para "Agendado")
+3. Paciente pergunta o que tem na agenda dele → use consultar_agenda
+4. Urgência médica → use transferir_para_humano(urgente=true)
+5. Execute tools em silêncio e depois responda ao paciente naturalmente.
+
+REGRAS IMPORTANTES SOBRE AGENDAMENTO:
+- NUNCA invente um horário disponível. SEMPRE consulte primeiro com listar_horarios_disponiveis.
+- Cada consulta dura 30 minutos por padrão.
+- Atendimento: segunda a sexta, 8h às 18h. NÃO há atendimento em fins de semana.${contextoPaciente}`;
 
   // Loop de tool use (permite múltiplas chamadas em sequência)
   let textoResposta = '';
@@ -3582,6 +3683,22 @@ async function carregarKanban(){
     else grupos['Novo Lead'].push(p);
   });
 
+  // Busca próximas consultas de TODOS os pacientes (uma query só)
+  const todosIds = (data||[]).map(p => p.id);
+  let consultasMap = {};
+  if(todosIds.length){
+    const { data: consultasFut } = await sb.from('consultas')
+      .select('paciente_id, data_hora_inicio, status, modalidade')
+      .in('paciente_id', todosIds)
+      .gte('data_hora_inicio', new Date().toISOString())
+      .neq('status','cancelada')
+      .order('data_hora_inicio', {ascending:true});
+    (consultasFut||[]).forEach(c => {
+      // Mantém só a próxima por paciente
+      if(!consultasMap[c.paciente_id]) consultasMap[c.paciente_id] = c;
+    });
+  }
+
   // Renderiza cada coluna
   ESTAGIOS.forEach(est => {
     const col   = document.getElementById('kcol-'+est.idx);
@@ -3597,9 +3714,25 @@ async function carregarKanban(){
 
     col.innerHTML = lista.map(p => {
       const pr       = p.profissionais || {};
-      const tagClass = pr.inicial === 'V' ? 'tag-v' : 'tag-i';
+      const tagClass = pr.inicial === 'A' ? 'tag-v' : pr.inicial === 'J' ? 'tag-i' : 'tag-s';
       const icon     = ORIGEM_ICON[p.origem] || '📋';
       const data_br  = new Date(p.created_at).toLocaleDateString('pt-BR');
+      // Próxima consulta (se houver)
+      const proxConsulta = consultasMap[p.id];
+      const consultaBadge = proxConsulta ? (() => {
+        const dt = new Date(proxConsulta.data_hora_inicio);
+        const hoje = new Date();
+        const amanha = new Date(); amanha.setDate(hoje.getDate()+1);
+        const isHoje = dt.toDateString() === hoje.toDateString();
+        const isAmanha = dt.toDateString() === amanha.toDateString();
+        const dataStr = isHoje ? 'Hoje' : isAmanha ? 'Amanhã' : dt.toLocaleDateString('pt-BR',{day:'2-digit',month:'2-digit'});
+        const horaStr = dt.toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
+        const cor = isHoje ? '#c0392b' : isAmanha ? '#e67e22' : '#2d5a4e';
+        const bg  = isHoje ? '#fde9e9' : isAmanha ? '#fff4e6' : '#e8f0ee';
+        return `<div style="display:flex;align-items:center;gap:6px;padding:6px 10px;background:${bg};border-radius:6px;margin-top:8px;font-size:11.5px;font-weight:600;color:${cor}">
+          <span>📅</span><span>${dataStr} · ${horaStr}</span>
+        </div>`;
+      })() : '';
 
       // Campos comerciais
       const isParticular = !p.convenio || p.convenio === 'Particular';
@@ -3629,7 +3762,8 @@ async function carregarKanban(){
           onclick="abrirDrawerDB('${p.id}')">
           <div class="kcard-name">${p.nome} ${p.sobrenome}</div>
           <div class="kcard-meta" style="margin-bottom:8px">${icon} ${p.origem||'—'} · ${p.whatsapp||p.telefone||'—'}</div>
-          <div class="kcard-tags">
+          ${consultaBadge}
+          <div class="kcard-tags" style="margin-top:8px">
             <span class="kcard-tag" style="background:${pgtoBg};color:${pgtoCor}">${pgtoLabel}</span>
             <span class="kcard-tag" style="background:#f3e5f5;color:#7b1fa2">${tipoLabel}</span>
             ${modalBadge}
