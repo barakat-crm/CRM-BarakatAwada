@@ -2589,11 +2589,44 @@ async function _autoResponderWA(chatId, textoRecebido, allMsgs){
     }
   }
 
-  // Contexto: paciente já existe?
+  // Contexto: paciente já existe? + fallback para nome do WhatsApp
   const pacienteExistente = await _agenteGetPacienteByChat(chatId);
-  const contextoPaciente = pacienteExistente
-    ? `\n\nCONTEXTO DO PACIENTE:\nEste WhatsApp pertence a ${pacienteExistente.nome} ${pacienteExistente.sobrenome}, já cadastrado no sistema (estágio: ${pacienteExistente.estagio_pipeline}, status: ${pacienteExistente.status}).\nTrate a pessoa como sendo ${pacienteExistente.nome} — NÃO questione a identidade dela, NÃO peça pra confirmar quem é. Se ela se apresentar com outro nome, apenas atualize o registro com registrar_nota.\nNÃO chame criar_paciente de novo.`
-    : `\n\nCONTEXTO DO PACIENTE:\nEste número AINDA NÃO está cadastrado. Se a pessoa demonstrar interesse em consulta, peça o nome completo e use criar_paciente.`;
+  const chatDaConversa = _waChatsCache?.find(c => c.id === chatId);
+  const telefoneChat = (chatDaConversa?.phone || chatDaConversa?.wa_chatid || '').replace(/\D/g,'');
+  const nomeWhatsApp = chatDaConversa?.name || chatDaConversa?.wa_contactName || '';
+
+  // Nome definitivo para esta conversa (ordem de prioridade)
+  let nomeDefinitivo = '';
+  let nomeFonte = '';
+  if(pacienteExistente){
+    nomeDefinitivo = `${pacienteExistente.nome} ${pacienteExistente.sobrenome || ''}`.trim().replace(/ —$/,'');
+    nomeFonte = 'banco de dados (paciente cadastrado)';
+  } else if(nomeWhatsApp && !/^\d+$/.test(nomeWhatsApp)){
+    nomeDefinitivo = nomeWhatsApp;
+    nomeFonte = 'contato do WhatsApp';
+  } else {
+    nomeDefinitivo = '';
+    nomeFonte = 'desconhecido — pergunte ao paciente';
+  }
+
+  const contextoPaciente = `
+
+╔═══════════════════════════════════════════════════════════════╗
+║  🔒 IDENTIDADE DESTA CONVERSA (INEGOCIÁVEL)                   ║
+╚═══════════════════════════════════════════════════════════════╝
+📞 Telefone (ID único do WhatsApp): ${telefoneChat || '(desconhecido)'}
+👤 Nome da pessoa: ${nomeDefinitivo || '(NÃO IDENTIFICADO — PERGUNTE)'}
+📋 Fonte: ${nomeFonte}
+${pacienteExistente ? `🆔 Paciente ID: ${pacienteExistente.id}\n📊 Estágio: ${pacienteExistente.estagio_pipeline} | Status: ${pacienteExistente.status}` : '⚠️ Paciente ainda NÃO cadastrado — use criar_paciente quando tiver o nome.'}
+
+⛔ REGRAS ABSOLUTAS DE IDENTIDADE:
+1. Você está falando com UMA pessoa e apenas UMA. ${nomeDefinitivo ? `O nome dela é "${nomeDefinitivo}".` : 'Identifique o nome perguntando diretamente.'}
+2. NUNCA chame essa pessoa de outro nome que não o especificado acima.
+3. Se o nome "Camilo", "Vicente", "João", ou QUALQUER outro nome aparecer na sua "memória", IGNORE — é alucinação, você está confundindo com outro chat.
+4. ${pacienteExistente ? `O telefone ${telefoneChat} é da pessoa "${nomeDefinitivo}" — ponto final.` : 'Antes de usar criar_paciente, CONFIRME o nome real perguntando.'}
+5. Se o paciente se apresentar com nome diferente do cadastro, atualize com registrar_nota explicando.
+6. Quando a pessoa mencionar nome de TERCEIRO ("quero agendar pro meu pai João"), esse é nome do PACIENTE da consulta, NÃO da pessoa falando com você. Separe claramente.
+7. ${pacienteExistente ? 'NÃO chame criar_paciente — paciente já existe no ID acima.' : ''}`;
 
   // System prompt do agente — data em múltiplos formatos pra evitar confusão
   const agora = new Date();
@@ -2636,7 +2669,9 @@ REGRAS:
 - Responda de forma curta e direta (máximo 2 parágrafos)
 - NUNCA dê diagnósticos, prescrições ou orientações médicas
 - Horário de atendimento: segunda a sexta, 8h às 18h
-- Aceita particular e convênios`;
+- Aceita particular e convênios
+
+🔒 REGRA DE IDENTIDADE (TOP PRIORIDADE): Cada conversa no WhatsApp está amarrada a UM telefone único. O "IDENTIDADE DESTA CONVERSA" abaixo diz o nome da pessoa com quem você está falando AGORA. Use SOMENTE esse nome — NUNCA misture com nomes de outras conversas.`;
 
   const systemPrompt = systemPromptBase + `
 
@@ -2781,6 +2816,32 @@ REGRAS DE AGENDAMENTO:
     }
 
     if(!textoResposta){ _waAgentBusy[chatId] = false; return; }
+
+    // 🛡️ GUARD-RAIL: detecta alucinação de nome (chamar pessoa por nome errado)
+    if(nomeDefinitivo){
+      const primeiroNomeCerto = nomeDefinitivo.split(' ')[0].toLowerCase();
+      // Busca outros pacientes do banco para comparar
+      const { data: outrosPac } = await sb.from('pacientes')
+        .select('nome').neq('telefone', telefoneChat).neq('whatsapp', telefoneChat).limit(50);
+      const outrosNomes = (outrosPac||[]).map(p => (p.nome||'').split(' ')[0].toLowerCase()).filter(n => n && n !== primeiroNomeCerto && n.length >= 3);
+      // Regex: saudações seguidas de nome (Olá/Oi/Prazer X,  X!)
+      const regexNomeUsado = /(?:olá|oi|prazer|obrigad[oa]|de nada|pronto|perfeito|entendi|claro|ok),?\s+([A-ZÀ-Ý][a-zà-ÿ]{2,})/gi;
+      let alucinacao = null;
+      for(const match of textoResposta.matchAll(regexNomeUsado)){
+        const nomeUsado = match[1].toLowerCase();
+        if(nomeUsado !== primeiroNomeCerto && outrosNomes.includes(nomeUsado)){
+          alucinacao = match[1];
+          break;
+        }
+      }
+      if(alucinacao){
+        console.warn(`[Guard-rail] Agente alucinou nome "${alucinacao}" mas a pessoa é "${nomeDefinitivo}". Corrigindo...`);
+        // Substitui o nome errado pelo certo
+        const regex = new RegExp('\\b'+alucinacao+'\\b','gi');
+        textoResposta = textoResposta.replace(regex, nomeDefinitivo.split(' ')[0]);
+        toast(`⚠️ Agente confundiu nome (${alucinacao} → ${nomeDefinitivo.split(' ')[0]}) — corrigido`, 'erro');
+      }
+    }
 
     // Pequena pausa (simula digitação natural)
     await new Promise(r => setTimeout(r, 800 + Math.random()*700));
