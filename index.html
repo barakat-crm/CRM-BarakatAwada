@@ -935,6 +935,61 @@
       <!-- TAB: INTEGRAÇÕES -->
       <div id="cfg-tab-integracao" class="cfg-tab-panel">
 
+        <!-- PROVIDER DE IA -->
+        <div class="card" style="margin-bottom:20px">
+          <div class="card-header">
+            <span>🤖</span>
+            <span class="card-title">Provider de IA</span>
+          </div>
+          <div style="padding:20px">
+            <div style="margin-bottom:16px">
+              <div style="display:flex;gap:16px;margin-bottom:12px">
+                <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+                  <input type="radio" name="cfg-provider" value="openai" id="cfg-provider-openai">
+                  <span style="font-size:13px">🟢 <strong>OpenAI</strong> (GPT-4.1-mini) <span style="color:var(--accent);font-size:11px">recomendado</span></span>
+                </label>
+                <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+                  <input type="radio" name="cfg-provider" value="anthropic" id="cfg-provider-anthropic">
+                  <span style="font-size:13px">🟣 <strong>Anthropic</strong> (Claude Sonnet 4.5)</span>
+                </label>
+              </div>
+              <div class="toggle-wrap" style="padding:4px 0">
+                <div style="flex:1">
+                  <div class="toggle-label">Fallback automático</div>
+                  <div class="toggle-desc">Se o provider principal falhar, usa o outro</div>
+                </div>
+                <div class="toggle on" id="tgl-fallback" onclick="toggleAIFallback(this)"></div>
+              </div>
+            </div>
+            <label class="form-label">🔑 API Key OpenAI</label>
+            <div style="display:flex;gap:8px">
+              <input id="cfg-openai-key" class="form-input" type="password" placeholder="sk-proj-..." style="flex:1">
+              <button class="btn btn-ghost" onclick="toggleVerOpenAIKey()">👁 Ver</button>
+            </div>
+            <div id="cfg-openai-status" style="font-size:12px;margin-top:6px"></div>
+            <div style="display:flex;gap:8px;margin-top:10px">
+              <button class="btn btn-primary" onclick="salvarOpenAIKey()">Salvar</button>
+              <button class="btn btn-ghost" onclick="testarOpenAIKey()">🧪 Testar conexão</button>
+            </div>
+            <hr style="margin:16px 0;border:none;border-top:1px solid var(--border)">
+            <div style="font-size:13px;font-weight:600;margin-bottom:10px">🎤 Multimodal</div>
+            <div class="toggle-wrap" style="padding:4px 0">
+              <div style="flex:1">
+                <div class="toggle-label">Transcrever áudios (Whisper)</div>
+                <div class="toggle-desc">Paciente manda áudio → agente transcreve e responde</div>
+              </div>
+              <div class="toggle on" id="tgl-whisper" onclick="toggleWhisper(this)"></div>
+            </div>
+            <div class="toggle-wrap" style="padding:4px 0">
+              <div style="flex:1">
+                <div class="toggle-label">Analisar imagens</div>
+                <div class="toggle-desc">Paciente manda foto de exame/receita → agente lê</div>
+              </div>
+              <div class="toggle on" id="tgl-vision" onclick="toggleVision(this)"></div>
+            </div>
+          </div>
+        </div>
+
         <!-- ANTHROPIC -->
         <div class="card" style="margin-bottom:16px">
           <div class="card-header">
@@ -1985,8 +2040,8 @@ async function _waPollingCheck(){
         if(!ultima.fromMe && tsUltima > tsSalvo && tsSalvo > 0){
           // Usa lógica centralizada: global ON + não pausado, OU individual ON
           if(_waAgenteAtivoParaChat(chatId)){
-            const textoMsg = ultima.content?.text || ultima.content?.caption || ultima.content?.conversation || '';
-            if(textoMsg) _autoResponderWA(chatId, textoMsg, msgs);
+            const multimodalContent = await _extrairConteudoMsg(ultima);
+            if(multimodalContent) _autoResponderWA(chatId, multimodalContent, msgs);
           }
         }
         // Atualiza o timestamp da última msg vista
@@ -2167,8 +2222,8 @@ async function _waGlobalPollingCheck(){
         continue;
       }
 
-      const textoMsg = ultima.content?.text || ultima.content?.caption || ultima.content?.conversation || '';
-      if(!textoMsg) { _waLastMsgTs[chatId] = tsUltima; continue; }
+      const multimodalContent = await _extrairConteudoMsg(ultima);
+      if(!multimodalContent) { _waLastMsgTs[chatId] = tsUltima; continue; }
 
       // DEDUPE: nunca responder a mesma mensagem 2 vezes
       const msgId = ultima.messageid || ultima.id || `${chatId}-${tsUltima}`;
@@ -2189,7 +2244,7 @@ async function _waGlobalPollingCheck(){
 
       // Aciona o agente para este chat
       _waLastMsgTs[chatId] = tsUltima;
-      _autoResponderWA(chatId, textoMsg, msgs);
+      _autoResponderWA(chatId, multimodalContent, msgs);
 
       // Se for o chat aberto, atualiza a tela
       if(_waCurrentChat?.id === chatId){
@@ -2570,13 +2625,308 @@ async function _agenteExecutarTool(nomeTool, args, chatId){
   }
 }
 
+// ═══════════════════════════════════════════════
+//  MULTI-PROVIDER AI — Abstração Anthropic / OpenAI
+// ═══════════════════════════════════════════════
+function getOpenAIKey(){ return localStorage.getItem('crm_openai_key') || ''; }
+function getAIProvider(){ return localStorage.getItem('crm_ai_provider') || 'openai'; }  // default: openai
+function getAIFallback(){ return localStorage.getItem('crm_ai_fallback') !== '0'; }       // default: true
+function getWhisperEnabled(){ return localStorage.getItem('crm_whisper_enabled') !== '0'; } // default: true
+function getVisionEnabled(){ return localStorage.getItem('crm_vision_enabled') !== '0'; }   // default: true
+
+// Modelos default por provider
+function getDefaultModel(provider){
+  if(provider === 'openai') return 'gpt-4.1-mini';
+  return 'claude-sonnet-4-5';
+}
+
+// Converte tool schema Anthropic → OpenAI
+function _toolsAnthropicToOpenAI(tools){
+  return tools.map(t => ({
+    type: 'function',
+    function: {
+      name: t.name,
+      description: t.description,
+      parameters: t.input_schema
+    }
+  }));
+}
+
+// Converte mensagem Anthropic (com content blocks) → OpenAI (texto + tool_calls)
+function _msgsAnthropicToOpenAI(messages){
+  const out = [];
+  for(const m of messages){
+    if(typeof m.content === 'string'){
+      out.push({ role: m.role, content: m.content });
+    } else if(Array.isArray(m.content)){
+      if(m.role === 'assistant'){
+        // Separa text de tool_use
+        const textBlocks = m.content.filter(b => b.type === 'text');
+        const toolBlocks = m.content.filter(b => b.type === 'tool_use');
+        const text = textBlocks.map(b => b.text).join('\n') || null;
+        const tool_calls = toolBlocks.map(b => ({
+          id: b.id,
+          type: 'function',
+          function: { name: b.name, arguments: JSON.stringify(b.input || {}) }
+        }));
+        const msg = { role: 'assistant' };
+        if(text) msg.content = text;
+        if(tool_calls.length) msg.tool_calls = tool_calls;
+        if(!text && !tool_calls.length) msg.content = '';
+        out.push(msg);
+      } else if(m.role === 'user'){
+        // Tool results vão como mensagens tool separadas
+        const toolResults = m.content.filter(b => b.type === 'tool_result');
+        const otherBlocks = m.content.filter(b => b.type !== 'tool_result');
+        for(const tr of toolResults){
+          out.push({
+            role: 'tool',
+            tool_call_id: tr.tool_use_id,
+            content: typeof tr.content === 'string' ? tr.content : JSON.stringify(tr.content)
+          });
+        }
+        if(otherBlocks.length){
+          // Converte image + text
+          const content = otherBlocks.map(b => {
+            if(b.type === 'text') return { type: 'text', text: b.text };
+            if(b.type === 'image' && b.source?.data){
+              return { type: 'image_url', image_url: { url: `data:${b.source.media_type || 'image/jpeg'};base64,${b.source.data}` }};
+            }
+            return null;
+          }).filter(Boolean);
+          if(content.length){
+            out.push({ role: 'user', content: content.length === 1 && content[0].type === 'text' ? content[0].text : content });
+          }
+        }
+      }
+    }
+  }
+  return out;
+}
+
+// Chamada unificada — retorna { stopReason: 'tool_use'|'end', textResponse, toolCalls: [{id,name,input}], rawAssistantMessage }
+async function aiCall({ provider, model, system, messages, tools, maxTokens = 1000, temperature = 0.3 }){
+  if(provider === 'openai'){
+    const key = getOpenAIKey();
+    if(!key) throw new Error('OpenAI key não configurada');
+    const body = {
+      model: model || 'gpt-4.1-mini',
+      max_tokens: maxTokens,
+      temperature,
+      messages: [{ role: 'system', content: system }, ..._msgsAnthropicToOpenAI(messages)]
+    };
+    if(tools && tools.length) body.tools = _toolsAnthropicToOpenAI(tools);
+    const r = await fetch('https://api.openai.com/v1/chat/completions', {
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':`Bearer ${key}`},
+      body: JSON.stringify(body)
+    });
+    if(!r.ok){ const err = await r.json().catch(()=>({})); throw new Error('OpenAI: '+ (err.error?.message || r.status)); }
+    const data = await r.json();
+    const choice = data.choices?.[0];
+    const msg = choice?.message || {};
+    const toolCalls = (msg.tool_calls || []).map(tc => ({
+      id: tc.id,
+      name: tc.function.name,
+      input: (() => { try { return JSON.parse(tc.function.arguments || '{}'); } catch(e){ return {}; } })()
+    }));
+    // Monta rawAssistantMessage no formato Anthropic (para histórico unificado)
+    const contentBlocks = [];
+    if(msg.content) contentBlocks.push({ type: 'text', text: msg.content });
+    for(const tc of toolCalls){
+      contentBlocks.push({ type: 'tool_use', id: tc.id, name: tc.name, input: tc.input });
+    }
+    return {
+      stopReason: toolCalls.length ? 'tool_use' : 'end',
+      textResponse: msg.content || '',
+      toolCalls,
+      rawAssistantMessage: { role: 'assistant', content: contentBlocks }
+    };
+  }
+  else { // anthropic
+    const key = getAnthropicKey();
+    if(!key) throw new Error('Anthropic key não configurada');
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method:'POST',
+      headers:{'Content-Type':'application/json','x-api-key':key,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
+      body: JSON.stringify({
+        model: model || 'claude-sonnet-4-5',
+        max_tokens: maxTokens,
+        temperature,
+        system,
+        tools,
+        messages
+      })
+    });
+    if(!r.ok){ const err = await r.json().catch(()=>({})); throw new Error('Anthropic: '+ (err.error?.message || r.status)); }
+    const data = await r.json();
+    const toolUses = (data.content || []).filter(b => b.type === 'tool_use');
+    const textBlock = (data.content || []).find(b => b.type === 'text');
+    return {
+      stopReason: data.stop_reason === 'tool_use' ? 'tool_use' : 'end',
+      textResponse: textBlock?.text || '',
+      toolCalls: toolUses.map(t => ({ id: t.id, name: t.name, input: t.input })),
+      rawAssistantMessage: { role: 'assistant', content: data.content }
+    };
+  }
+}
+
+// aiCallWithFallback: tenta provider principal, se falhar tenta o outro (se fallback ativo)
+async function aiCallWithFallback(params){
+  const primary = getAIProvider();
+  const useFallback = getAIFallback();
+  try {
+    return await aiCall({ ...params, provider: primary, model: params.model || getDefaultModel(primary) });
+  } catch(e){
+    console.error(`[AI] ${primary} falhou:`, e.message);
+    if(!useFallback) throw e;
+    const secondary = primary === 'openai' ? 'anthropic' : 'openai';
+    console.warn(`[AI] Tentando fallback com ${secondary}`);
+    toast(`⚠️ ${primary} falhou, usando ${secondary}`, 'erro');
+    return await aiCall({ ...params, provider: secondary, model: getDefaultModel(secondary) });
+  }
+}
+
+// ═══════════════════════════════════════════════
+//  MULTIMODAL — Áudio (Whisper) + Imagem
+// ═══════════════════════════════════════════════
+async function transcreverAudioWhisper(audioBlob, mimeType){
+  const key = getOpenAIKey();
+  if(!key) throw new Error('OpenAI key necessária para Whisper');
+  const form = new FormData();
+  // Whisper aceita: flac, m4a, mp3, mp4, mpeg, mpga, oga, ogg, wav, webm
+  const ext = mimeType?.includes('ogg') ? 'ogg' : mimeType?.includes('mp4') ? 'm4a' : 'mp3';
+  form.append('file', audioBlob, `audio.${ext}`);
+  form.append('model', 'whisper-1');
+  form.append('language', 'pt');
+  const r = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${key}` },
+    body: form
+  });
+  if(!r.ok){ const err = await r.json().catch(()=>({})); throw new Error('Whisper: '+ (err.error?.message || r.status)); }
+  const data = await r.json();
+  return data.text || '';
+}
+
+async function _waBaixarMidiaUAZAPI(msgObj){
+  // Tenta baixar a mídia da mensagem via endpoint da UAZAPI
+  const url = _waApiUrl();
+  const tok = _waApiToken();
+  const msgId = msgObj.messageid || msgObj.id;
+  if(!msgId) return null;
+  try {
+    // Endpoint UAZAPI para download de mídia
+    const r = await fetch(`${url}/message/download`, {
+      method:'POST',
+      headers:{'Content-Type':'application/json','token':tok},
+      body: JSON.stringify({ messageid: msgId })
+    });
+    if(!r.ok){
+      // Fallback: tenta URL direta se existir
+      const directUrl = msgObj.content?.audioMessage?.url || msgObj.content?.imageMessage?.url || msgObj.fileURL;
+      if(directUrl){
+        const r2 = await fetch(directUrl);
+        if(r2.ok) return await r2.blob();
+      }
+      return null;
+    }
+    // UAZAPI retorna ou blob direto ou {url, base64}
+    const ct = r.headers.get('content-type') || '';
+    if(ct.includes('application/json')){
+      const data = await r.json();
+      if(data.base64){
+        // converte base64 → blob
+        const byteChars = atob(data.base64);
+        const byteNums = new Array(byteChars.length);
+        for(let i=0;i<byteChars.length;i++) byteNums[i] = byteChars.charCodeAt(i);
+        return new Blob([new Uint8Array(byteNums)], { type: data.mimetype || 'application/octet-stream' });
+      }
+      if(data.url){
+        const r2 = await fetch(data.url);
+        return r2.ok ? await r2.blob() : null;
+      }
+      return null;
+    }
+    return await r.blob();
+  } catch(e){
+    console.error('[Mídia] Erro ao baixar:', e);
+    return null;
+  }
+}
+
+async function _blobParaBase64(blob){
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const b64 = reader.result.split(',')[1]; // tira o prefixo data:...;base64,
+      resolve(b64);
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+// Extrai conteúdo de uma msg: texto puro OU array de content blocks (texto + imagem)
+// Retorna null se não houver nada processável
+async function _extrairConteudoMsg(msgObj){
+  const texto = msgObj.content?.text || msgObj.content?.caption || msgObj.content?.conversation || '';
+  const tipo = msgObj.messageType || '';
+  const temAudio = /audio/i.test(tipo) || !!msgObj.content?.audioMessage;
+  const temImagem = /image/i.test(tipo) || !!msgObj.content?.imageMessage;
+
+  // TEXTO PURO
+  if(texto && !temAudio && !temImagem) return texto;
+
+  // ÁUDIO — transcreve via Whisper
+  if(temAudio && getWhisperEnabled()){
+    try {
+      const blob = await _waBaixarMidiaUAZAPI(msgObj);
+      if(!blob) return texto || null;
+      const transcricao = await transcreverAudioWhisper(blob, blob.type);
+      if(transcricao){
+        toast(`🎤 Áudio transcrito (${transcricao.length} chars)`);
+        return `[Áudio do paciente transcrito]: ${transcricao}${texto ? '\n(legenda: '+texto+')' : ''}`;
+      }
+    } catch(e){
+      console.error('[Whisper] erro:', e);
+      toast('⚠️ Erro ao transcrever áudio: ' + e.message, 'erro');
+    }
+    return texto || '[Paciente enviou áudio — não foi possível transcrever]';
+  }
+
+  // IMAGEM — envia como content block multimodal
+  if(temImagem && getVisionEnabled()){
+    try {
+      const blob = await _waBaixarMidiaUAZAPI(msgObj);
+      if(!blob) return texto || null;
+      const b64 = await _blobParaBase64(blob);
+      const mime = blob.type || 'image/jpeg';
+      toast('📸 Imagem recebida — analisando...');
+      // Retorna array de content blocks (formato Anthropic, que será traduzido p/ OpenAI se necessário)
+      return [
+        { type: 'image', source: { type: 'base64', media_type: mime, data: b64 }},
+        { type: 'text', text: texto || '[imagem enviada pelo paciente — analise e responda]' }
+      ];
+    } catch(e){
+      console.error('[Vision] erro:', e);
+      toast('⚠️ Erro ao processar imagem: ' + e.message, 'erro');
+    }
+    return texto || '[Paciente enviou imagem — não foi possível analisar]';
+  }
+
+  return texto || null;
+}
+
 // ── Auto-Responder IA (com Tool Use) ──────────────────────────
 async function _autoResponderWA(chatId, textoRecebido, allMsgs){
   // Nota: o polling já setou _waAgentBusy[chatId]=true de forma SÍNCRONA antes de nos chamar.
   // Mas se for chamado por outro caminho (ex: abrir chat manualmente), garantimos aqui também.
   if(!_waAgentBusy[chatId]) _waAgentBusy[chatId] = true;
-  const key = getAnthropicKey();
-  if(!key){ _waAgentBusy[chatId] = false; return; }
+  // Verifica se pelo menos um provider está configurado
+  const hasAnthropic = !!getAnthropicKey();
+  const hasOpenAI = !!getOpenAIKey();
+  if(!hasAnthropic && !hasOpenAI){ _waAgentBusy[chatId] = false; return; }
 
   // Monta histórico de conversa
   if(!_waConvHistory[chatId]) _waConvHistory[chatId] = [];
@@ -2585,7 +2935,6 @@ async function _autoResponderWA(chatId, textoRecebido, allMsgs){
   // Pega configuração do agente salva pelo usuário
   const cfg = JSON.parse(localStorage.getItem('crm_agente_config') || '{}');
   const nomeAgente   = cfg.nome || 'Assistente Barakat Awada';
-  const modelo       = _waMapModel(cfg.modelo || 'claude-sonnet-4-6');
   const temperatura  = cfg.criatividade ?? 0.7;
   const promptCustom = cfg.prompt || '';
   const clinica = getClinicaNome();
@@ -2785,56 +3134,38 @@ REGRAS DE AGENDAMENTO:
     while(tentativas < MAX_TENTATIVAS){
       tentativas++;
 
-      const resp = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': key,
-          'anthropic-version': '2023-06-01',
-          'anthropic-dangerous-direct-browser-access': 'true'
-        },
-        body: JSON.stringify({
-          model: modelo,
-          max_tokens: 1000,
-          temperature: temperatura,
+      let aiResult;
+      try {
+        aiResult = await aiCallWithFallback({
           system: systemPrompt,
+          messages: _waConvHistory[chatId].slice(-20),
           tools: _AGENTE_TOOLS,
-          messages: _waConvHistory[chatId].slice(-20)
-        })
-      });
-
-      if(!resp.ok){
-        const err = await resp.json();
-        console.error('[Agente IA] Erro Claude:', err);
+          maxTokens: 1000,
+          temperature: temperatura
+        });
+      } catch(e){
+        console.error('[Agente IA] Ambos providers falharam:', e);
         break;
       }
 
-      const data = await resp.json();
+      _waConvHistory[chatId].push(aiResult.rawAssistantMessage);
 
-      // Adiciona a resposta do assistant ao histórico
-      _waConvHistory[chatId].push({ role:'assistant', content: data.content });
-
-      // Verifica se o modelo pediu para usar uma tool
-      if(data.stop_reason === 'tool_use'){
-        const toolUses = data.content.filter(b => b.type === 'tool_use');
+      if(aiResult.stopReason === 'tool_use' && aiResult.toolCalls.length){
         const toolResults = [];
-        for(const tu of toolUses){
-          console.log('[Tool] Executando:', tu.name, tu.input);
-          const resultado = await _agenteExecutarTool(tu.name, tu.input, chatId);
+        for(const tc of aiResult.toolCalls){
+          console.log('[Tool] Executando:', tc.name, tc.input);
+          const resultado = await _agenteExecutarTool(tc.name, tc.input, chatId);
           toolResults.push({
             type: 'tool_result',
-            tool_use_id: tu.id,
-            content: JSON.stringify(resultado),
+            tool_use_id: tc.id,
+            content: JSON.stringify(resultado)
           });
         }
-        // Envia o resultado de volta para o modelo continuar
         _waConvHistory[chatId].push({ role:'user', content: toolResults });
-        continue; // vai para próxima iteração
+        continue;
       }
 
-      // Chegou ao final — extrai texto
-      const blocoTexto = data.content.find(b => b.type === 'text');
-      textoResposta = blocoTexto?.text || '';
+      textoResposta = aiResult.textResponse;
       break;
     }
 
@@ -5354,6 +5685,66 @@ function salvarConfiguracoes(){
   toast('✓ Configurações salvas!');
 }
 
+function salvarOpenAIKey(){
+  const key = document.getElementById('cfg-openai-key').value.trim();
+  if(key) localStorage.setItem('crm_openai_key', key);
+  else localStorage.removeItem('crm_openai_key');
+  atualizarStatusOpenAIKey(key);
+  toast('✓ OpenAI key salva!');
+}
+
+function atualizarStatusOpenAIKey(key){
+  const el = document.getElementById('cfg-openai-status');
+  if(!el) return;
+  if(key && key.startsWith('sk-')){
+    el.innerHTML = '<span style="color:var(--success);font-weight:600">✓ Key configurada</span>';
+  } else if(key){
+    el.innerHTML = '<span style="color:var(--warning)">⚠ Formato inválido</span>';
+  } else {
+    el.innerHTML = '<span style="color:var(--text-muted)">Nenhuma key</span>';
+  }
+}
+
+function toggleVerOpenAIKey(){
+  const inp = document.getElementById('cfg-openai-key');
+  inp.type = inp.type === 'password' ? 'text' : 'password';
+}
+
+async function testarOpenAIKey(){
+  const key = getOpenAIKey();
+  if(!key){ toast('Configure a key primeiro','erro'); return; }
+  try {
+    const r = await fetch('https://api.openai.com/v1/chat/completions', {
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':`Bearer ${key}`},
+      body: JSON.stringify({ model:'gpt-4.1-mini', max_tokens:5, messages:[{role:'user',content:'ping'}]})
+    });
+    if(r.ok) toast('✓ Conexão OK');
+    else { const err = await r.json(); toast('Erro: '+(err.error?.message||r.status), 'erro'); }
+  } catch(e){ toast('Erro: '+e.message,'erro'); }
+}
+
+function toggleAIFallback(el){
+  el.classList.toggle('on');
+  localStorage.setItem('crm_ai_fallback', el.classList.contains('on') ? '1' : '0');
+}
+
+function toggleWhisper(el){
+  el.classList.toggle('on');
+  localStorage.setItem('crm_whisper_enabled', el.classList.contains('on') ? '1' : '0');
+}
+
+function toggleVision(el){
+  el.classList.toggle('on');
+  localStorage.setItem('crm_vision_enabled', el.classList.contains('on') ? '1' : '0');
+}
+
+function onProviderChange(){
+  const val = document.querySelector('input[name="cfg-provider"]:checked')?.value || 'openai';
+  localStorage.setItem('crm_ai_provider', val);
+  toast(`Provider trocado para ${val === 'openai' ? 'OpenAI (GPT-4.1-mini)' : 'Anthropic (Claude Sonnet 4.5)'}`);
+}
+
 async function testarApiKey(){
   const key = getAnthropicKey();
   if(!key){ toast('Configure a API key primeiro','erro'); return; }
@@ -5692,6 +6083,24 @@ function carregarIntegracoes(){
     elA.style.background = '#e8f5e9';
     elA.style.color = '#2e7d32';
   }
+  // Provider + OpenAI key + Toggles
+  const provider = getAIProvider();
+  const radio = document.getElementById('cfg-provider-'+provider);
+  if(radio) radio.checked = true;
+  // Adiciona listeners nos radios
+  document.querySelectorAll('input[name="cfg-provider"]').forEach(r => r.addEventListener('change', onProviderChange));
+  // OpenAI key
+  const okey = getOpenAIKey();
+  const oinp = document.getElementById('cfg-openai-key');
+  if(oinp) oinp.value = okey;
+  atualizarStatusOpenAIKey(okey);
+  // Toggles
+  const tglFb = document.getElementById('tgl-fallback');
+  if(tglFb) tglFb.classList.toggle('on', getAIFallback());
+  const tglW = document.getElementById('tgl-whisper');
+  if(tglW) tglW.classList.toggle('on', getWhisperEnabled());
+  const tglV = document.getElementById('tgl-vision');
+  if(tglV) tglV.classList.toggle('on', getVisionEnabled());
 }
 
 // ── SALVAR / CARREGAR AGENTE ─────────────────────
