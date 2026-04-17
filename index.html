@@ -1996,6 +1996,26 @@ async function _waPollingCheck(){
 }
 
 // ── Toggle Agente Global (todas as conversas) ─────────────────
+function _atualizarBotaoAgenteGlobal(){
+  const btn = document.getElementById('btn-agente-global');
+  if(!btn) return;
+  btn.textContent       = _waAgentGlobal ? '🌐 Agente Global: On' : '🌐 Agente Global: Off';
+  btn.style.background  = _waAgentGlobal ? '#2d5a4e' : 'var(--surface2)';
+  btn.style.color       = _waAgentGlobal ? '#fff'    : 'var(--text-muted)';
+  btn.style.borderColor = _waAgentGlobal ? '#2d5a4e' : 'var(--border)';
+}
+
+function _iniciarPollingGlobal(){
+  if(!_waAgentGlobal) return;
+  // Marca timestamp atual em todos os chats carregados (só responde msgs FUTURAS)
+  (_waChatsCache||[]).forEach(c => {
+    if(!_waLastMsgTs[c.id]) _waLastMsgTs[c.id] = Date.now();
+  });
+  // Inicia polling global a cada 15 segundos
+  clearInterval(_waGlobalTimer);
+  _waGlobalTimer = setInterval(_waGlobalPollingCheck, 15000);
+}
+
 function toggleAgenteGlobal(){
   const key = getAnthropicKey();
   if(!key){
@@ -2003,21 +2023,11 @@ function toggleAgenteGlobal(){
     return;
   }
   _waAgentGlobal = !_waAgentGlobal;
-  const btn = document.getElementById('btn-agente-global');
-  if(btn){
-    btn.textContent    = _waAgentGlobal ? '🌐 Agente Global: On' : '🌐 Agente Global: Off';
-    btn.style.background  = _waAgentGlobal ? '#2d5a4e' : 'var(--surface2)';
-    btn.style.color       = _waAgentGlobal ? '#fff'    : 'var(--text-muted)';
-    btn.style.borderColor = _waAgentGlobal ? '#2d5a4e' : 'var(--border)';
-  }
+  // Persiste o estado pra sobreviver refresh/reopen
+  localStorage.setItem('crm_agente_global_on', _waAgentGlobal ? '1' : '0');
+  _atualizarBotaoAgenteGlobal();
   if(_waAgentGlobal){
-    // Marca timestamp atual em todos os chats carregados (só responde msgs FUTURAS)
-    _waChatsCache.forEach(c => {
-      if(!_waLastMsgTs[c.id]) _waLastMsgTs[c.id] = Date.now();
-    });
-    // Inicia polling global a cada 15 segundos
-    clearInterval(_waGlobalTimer);
-    _waGlobalTimer = setInterval(_waGlobalPollingCheck, 15000);
+    _iniciarPollingGlobal();
     toast('🌐 Agente Global ativado — respondendo todas as conversas!');
   } else {
     clearInterval(_waGlobalTimer);
@@ -2027,6 +2037,26 @@ function toggleAgenteGlobal(){
   // Atualiza botão do chat aberto, se houver
   _waAtualizarBtnAgenteChat();
 }
+
+// Ao carregar a página, se estava ligado, reativar automaticamente
+async function _autoRetomarAgenteGlobal(){
+  try{
+    if(localStorage.getItem('crm_agente_global_on') !== '1') return;
+    const key = getAnthropicKey();
+    if(!key) return;
+    // Carrega chats primeiro (para ter _waChatsCache)
+    if(typeof carregarChatsWA === 'function'){
+      try { await carregarChatsWA(); } catch(e) {}
+    }
+    _waAgentGlobal = true;
+    _atualizarBotaoAgenteGlobal();
+    _iniciarPollingGlobal();
+    console.log('[Agente] Auto-retomado do estado salvo');
+  }catch(e){ console.warn('[Agente] Erro ao retomar:', e); }
+}
+
+// Roda ao carregar (espera 2s para ter UAZAPI configurado/integracoes lidas)
+window.addEventListener('load', () => setTimeout(_autoRetomarAgenteGlobal, 2000));
 
 // Retorna true se o agente deve responder este chatId
 function _waAgenteAtivoParaChat(chatId){
