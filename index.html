@@ -2165,7 +2165,259 @@ function _waGetHistoryFromDOM(){
   return history.slice(-20); // Últimas 20 mensagens como contexto
 }
 
-// ── Auto-Responder IA ─────────────────────────────────────────
+// ═══════════════════════════════════════════════
+//  AGENTE IA — FERRAMENTAS (Tool Use)
+// ═══════════════════════════════════════════════
+
+// Profissionais conhecidos (para mapear nomes → UUIDs)
+const _PROFISSIONAIS = [
+  { id: '00000000-0000-0000-0000-000000000001', nome: 'Ali Mohamed',    apelidos: ['ali','dr ali','dr. ali','mohamed','dr mohamed'] },
+  { id: '00000000-0000-0000-0000-000000000002', nome: 'Jamile Barakat', apelidos: ['jamile','dra jamile','dra. jamile','jamile barakat'] },
+  { id: '00000000-0000-0000-0000-000000000003', nome: 'Soraia Barakat', apelidos: ['soraia','dra soraia','dra. soraia','soraia barakat'] },
+];
+
+function _agenteResolveProfissional(nomeOuId){
+  if(!nomeOuId) return null;
+  const n = String(nomeOuId).toLowerCase().trim();
+  // Já é UUID?
+  if(/^[0-9a-f-]{36}$/i.test(nomeOuId)) return nomeOuId;
+  const p = _PROFISSIONAIS.find(x => x.apelidos.some(a => n.includes(a)) || n.includes(x.nome.toLowerCase()));
+  return p ? p.id : null;
+}
+
+// Schema das tools que o agente pode chamar
+const _AGENTE_TOOLS = [
+  {
+    name: 'criar_paciente',
+    description: 'Cria um novo paciente no banco de dados quando identificar que é um lead novo. Use quando o paciente ainda não existe no CRM (primeira mensagem).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        nome_completo: { type: 'string', description: 'Nome completo do paciente (nome e sobrenome)' },
+        origem: { type: 'string', enum: ['whatsapp','indicacao','instagram','google','telefone','ubs','pediatra','outro'], description: 'Como o paciente chegou até a clínica' },
+        queixa: { type: 'string', description: 'Queixa principal ou motivo do contato (opcional)' },
+        profissional: { type: 'string', description: 'Nome do profissional desejado (Ali/Jamile/Soraia) ou deixe vazio se indefinido' },
+        convenio: { type: 'string', description: 'Nome do convênio ou "Particular"' },
+      },
+      required: ['nome_completo']
+    }
+  },
+  {
+    name: 'mover_estagio_pipeline',
+    description: 'Move o paciente para outro estágio do pipeline de vendas. Use quando houver uma mudança clara no estágio (ex: agendou consulta, confirmou, desistiu).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        novo_estagio: { type: 'string', enum: ['Novo Lead','Contato Feito','Agendado','Ativo','Alta'], description: 'Novo estágio do pipeline' },
+        motivo: { type: 'string', description: 'Breve motivo da mudança (registrado no histórico)' },
+      },
+      required: ['novo_estagio','motivo']
+    }
+  },
+  {
+    name: 'agendar_consulta',
+    description: 'Agenda uma consulta no calendário. Use APENAS quando o paciente confirmar data, horário e profissional específicos.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        data: { type: 'string', description: 'Data no formato YYYY-MM-DD (ex: 2026-04-20)' },
+        hora: { type: 'string', description: 'Hora no formato HH:MM 24h (ex: 14:30)' },
+        duracao_minutos: { type: 'number', description: 'Duração em minutos (padrão: 30)', default: 30 },
+        profissional: { type: 'string', description: 'Nome do profissional (Ali/Jamile/Soraia)' },
+        tipo: { type: 'string', enum: ['primeira_consulta','retorno','exame'], description: 'Tipo de consulta' },
+        modalidade: { type: 'string', enum: ['presencial','online'], description: 'Modalidade' },
+      },
+      required: ['data','hora','profissional','tipo']
+    }
+  },
+  {
+    name: 'registrar_nota',
+    description: 'Registra uma observação importante na timeline do paciente. Use para informações relevantes que a recepção/médico precisa saber (ex: pedidos especiais, informações médicas relevantes não-diagnósticas).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        titulo: { type: 'string', description: 'Título curto da nota' },
+        descricao: { type: 'string', description: 'Detalhes da observação' },
+      },
+      required: ['titulo','descricao']
+    }
+  },
+  {
+    name: 'marcar_perdido',
+    description: 'Marca o lead como perdido quando o paciente desiste, cancela sem remarcar, ou demonstra claramente que não tem interesse.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        motivo: { type: 'string', description: 'Motivo da perda (preço, convênio, desistiu, etc)' },
+      },
+      required: ['motivo']
+    }
+  },
+  {
+    name: 'transferir_para_humano',
+    description: 'Sinaliza que o atendimento precisa de um humano. Use quando: paciente pede explicitamente para falar com alguém da clínica, situação complexa que exige julgamento, reclamação, urgência médica.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        motivo: { type: 'string', description: 'Motivo da transferência' },
+        urgente: { type: 'boolean', description: 'True se precisa atendimento imediato' },
+      },
+      required: ['motivo']
+    }
+  },
+];
+
+// Retorna o paciente existente pelo telefone do chat
+async function _agenteGetPacienteByChat(chatId){
+  const chat = _waChatsCache?.find(c => c.id === chatId);
+  if(!chat) return null;
+  const phone = (chat.phone || chat.wa_chatid || '').replace(/\D/g,'');
+  if(!phone) return null;
+  // Tenta por whatsapp ou telefone
+  const { data } = await sb.from('pacientes')
+    .select('id, nome, sobrenome, status, estagio_pipeline, profissional_id')
+    .or(`whatsapp.ilike.%${phone}%,telefone.ilike.%${phone}%`)
+    .limit(1);
+  return data?.[0] || null;
+}
+
+// Executor das tools
+async function _agenteExecutarTool(nomeTool, args, chatId){
+  try {
+    const chat = _waChatsCache?.find(c => c.id === chatId);
+    const telefone = (chat?.phone || chat?.wa_chatid || '').replace(/\D/g,'');
+    let paciente = await _agenteGetPacienteByChat(chatId);
+
+    // ── CRIAR PACIENTE ─────────────────────
+    if(nomeTool === 'criar_paciente'){
+      if(paciente) return { ok: false, mensagem: `Paciente já existe: ${paciente.nome} ${paciente.sobrenome}` };
+      const partes = (args.nome_completo || '').trim().split(' ');
+      const nome = partes[0] || 'Paciente';
+      const sobrenome = partes.slice(1).join(' ') || '—';
+      const profId = _agenteResolveProfissional(args.profissional);
+      const { data, error } = await sb.from('pacientes').insert([{
+        nome, sobrenome,
+        telefone: telefone, whatsapp: telefone,
+        profissional_id: profId,
+        origem: args.origem || 'whatsapp',
+        status: 'lead',
+        estagio_pipeline: 'Novo Lead',
+        convenio: args.convenio || 'Particular',
+      }]).select().single();
+      if(error) return { ok:false, mensagem: 'Erro ao criar: ' + error.message };
+      if(args.queixa){
+        await sb.from('interacoes').insert([{
+          paciente_id: data.id, tipo:'contato_inicial', titulo:'Lead criado pelo agente',
+          descricao: args.queixa, autor:'agente_ia'
+        }]);
+      }
+      toast(`🤖 Paciente ${nome} ${sobrenome} criado pelo agente`);
+      if(typeof carregarKanban === 'function') carregarKanban();
+      if(typeof carregarPacientes === 'function') carregarPacientes();
+      return { ok:true, mensagem: `Paciente ${nome} ${sobrenome} criado com sucesso. ID: ${data.id}` };
+    }
+
+    // ── MOVER ESTÁGIO ──────────────────────
+    if(nomeTool === 'mover_estagio_pipeline'){
+      if(!paciente) return { ok:false, mensagem:'Paciente não encontrado. Crie primeiro usando criar_paciente.' };
+      const { error } = await sb.from('pacientes')
+        .update({ estagio_pipeline: args.novo_estagio })
+        .eq('id', paciente.id);
+      if(error) return { ok:false, mensagem: 'Erro: ' + error.message };
+      await sb.from('interacoes').insert([{
+        paciente_id: paciente.id, tipo:'mudanca_estagio',
+        titulo:`Movido para ${args.novo_estagio}`,
+        descricao: args.motivo, autor:'agente_ia'
+      }]);
+      toast(`🤖 ${paciente.nome} → ${args.novo_estagio}`);
+      if(typeof carregarKanban === 'function') carregarKanban();
+      return { ok:true, mensagem: `Paciente movido para ${args.novo_estagio}` };
+    }
+
+    // ── AGENDAR CONSULTA ───────────────────
+    if(nomeTool === 'agendar_consulta'){
+      if(!paciente) return { ok:false, mensagem:'Paciente não encontrado. Crie primeiro usando criar_paciente.' };
+      const profId = _agenteResolveProfissional(args.profissional);
+      if(!profId) return { ok:false, mensagem:`Profissional "${args.profissional}" não encontrado. Use Ali, Jamile ou Soraia.` };
+      const duracao = args.duracao_minutos || 30;
+      const inicio = new Date(`${args.data}T${args.hora}:00`);
+      const fim = new Date(inicio.getTime() + duracao*60000);
+      const { data, error } = await sb.from('consultas').insert([{
+        paciente_id: paciente.id,
+        profissional_id: profId,
+        titulo: `Consulta - ${paciente.nome} ${paciente.sobrenome}`,
+        data_hora_inicio: inicio.toISOString(),
+        data_hora_fim: fim.toISOString(),
+        tipo: args.tipo || 'primeira_consulta',
+        modalidade: args.modalidade || 'presencial',
+        status: 'agendada',
+      }]).select().single();
+      if(error) return { ok:false, mensagem: 'Erro: ' + error.message };
+      // Move automaticamente para "Agendado"
+      await sb.from('pacientes').update({
+        estagio_pipeline:'Agendado',
+        proxima_consulta: inicio.toISOString()
+      }).eq('id', paciente.id);
+      await sb.from('interacoes').insert([{
+        paciente_id: paciente.id, tipo:'agendamento',
+        titulo:`Consulta agendada`,
+        descricao: `${args.data} às ${args.hora} - ${args.profissional} (${args.modalidade||'presencial'})`,
+        autor:'agente_ia'
+      }]);
+      toast(`🤖 Consulta agendada: ${paciente.nome} em ${args.data} ${args.hora}`);
+      if(typeof carregarKanban === 'function') carregarKanban();
+      if(typeof carregarAgenda === 'function') carregarAgenda();
+      return { ok:true, mensagem:`Consulta agendada para ${args.data} às ${args.hora} com ${args.profissional}` };
+    }
+
+    // ── REGISTRAR NOTA ─────────────────────
+    if(nomeTool === 'registrar_nota'){
+      if(!paciente) return { ok:false, mensagem:'Paciente não encontrado.' };
+      await sb.from('interacoes').insert([{
+        paciente_id: paciente.id, tipo:'nota',
+        titulo: args.titulo, descricao: args.descricao, autor:'agente_ia'
+      }]);
+      return { ok:true, mensagem:'Nota registrada na timeline' };
+    }
+
+    // ── MARCAR PERDIDO ─────────────────────
+    if(nomeTool === 'marcar_perdido'){
+      if(!paciente) return { ok:false, mensagem:'Paciente não encontrado.' };
+      await sb.from('pacientes').update({ status:'perdido' }).eq('id', paciente.id);
+      await sb.from('interacoes').insert([{
+        paciente_id: paciente.id, tipo:'mudanca_estagio',
+        titulo:'Lead perdido', descricao: args.motivo, autor:'agente_ia'
+      }]);
+      toast(`🤖 ${paciente.nome} marcado como perdido`);
+      if(typeof carregarKanban === 'function') carregarKanban();
+      return { ok:true, mensagem:'Lead marcado como perdido' };
+    }
+
+    // ── TRANSFERIR PARA HUMANO ─────────────
+    if(nomeTool === 'transferir_para_humano'){
+      if(paciente){
+        await sb.from('interacoes').insert([{
+          paciente_id: paciente.id,
+          tipo: args.urgente ? 'urgencia' : 'transferencia',
+          titulo: args.urgente ? '🚨 URGENTE - Precisa atendimento humano' : '👤 Transferido para humano',
+          descricao: args.motivo, autor:'agente_ia'
+        }]);
+      }
+      // Desativa o agente para este chat
+      _waAgentChats[chatId] = false;
+      if(typeof _waAtualizarBtnAgenteChat === 'function') _waAtualizarBtnAgenteChat();
+      toast(args.urgente ? '🚨 Atendimento URGENTE solicitado!' : '👤 Transferido para humano', 'erro');
+      return { ok:true, mensagem:'Atendimento transferido. O agente foi pausado nesta conversa.' };
+    }
+
+    return { ok:false, mensagem:'Ferramenta desconhecida: ' + nomeTool };
+  } catch(e){
+    console.error('[Tool] erro:', e);
+    return { ok:false, mensagem:'Erro interno: ' + e.message };
+  }
+}
+
+// ── Auto-Responder IA (com Tool Use) ──────────────────────────
 async function _autoResponderWA(chatId, textoRecebido, allMsgs){
   if(_waAgentBusy[chatId]) return; // evita duplicata
   const key = getAnthropicKey();
@@ -2202,9 +2454,15 @@ async function _autoResponderWA(chatId, textoRecebido, allMsgs){
     }
   }
 
+  // Contexto: paciente já existe?
+  const pacienteExistente = await _agenteGetPacienteByChat(chatId);
+  const contextoPaciente = pacienteExistente
+    ? `\n\nCONTEXTO: Paciente já cadastrado — ${pacienteExistente.nome} ${pacienteExistente.sobrenome}, estágio atual: ${pacienteExistente.estagio_pipeline}, status: ${pacienteExistente.status}. NÃO chame criar_paciente de novo.`
+    : `\n\nCONTEXTO: Paciente AINDA NÃO cadastrado. Se ele demonstrar interesse, use a tool criar_paciente logo na primeira oportunidade (peça o nome completo se não souber).`;
+
   // System prompt do agente
-  const hoje = new Date().toLocaleDateString('pt-BR',{weekday:'long',day:'2-digit',month:'long'});
-  const systemPrompt = promptCustom ||
+  const hoje = new Date().toLocaleDateString('pt-BR',{weekday:'long',day:'2-digit',month:'long',year:'numeric'});
+  const systemPromptBase = promptCustom ||
     `Você é ${nomeAgente}, secretária virtual da Clínica Barakat Awada, especializada em Urologia e Clínica Geral. Hoje é ${hoje}.
 
 EQUIPE MÉDICA:
@@ -2216,49 +2474,94 @@ REGRAS:
 - Seja acolhedora, empática e profissional
 - Responda de forma curta e direta (máximo 2 parágrafos)
 - NUNCA dê diagnósticos, prescrições ou orientações médicas
-- Para agendar: pergunte nome completo, data/horário preferido, se tem convênio, e com qual profissional deseja consultar
-- Procedimentos urológicos (exames, cirurgias, biópsia): encaminhe para a recepção
-- Urgências: oriente procurar pronto-socorro imediatamente
 - Horário de atendimento: segunda a sexta, 8h às 18h
 - Aceita particular e convênios`;
 
-  try {
-    const resp = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': key,
-        'anthropic-version': '2023-06-01',
-        'anthropic-dangerous-direct-browser-access': 'true'
-      },
-      body: JSON.stringify({
-        model: modelo,
-        max_tokens: 500,
-        temperature: temperatura,
-        system: systemPrompt,
-        messages: _waConvHistory[chatId].slice(-16) // contexto das últimas 16 trocas
-      })
-    });
+  const systemPrompt = systemPromptBase + `
 
-    if(!resp.ok){
-      const err = await resp.json();
-      console.error('[Agente IA] Erro Claude:', err);
-      _waAgentBusy[chatId] = false;
-      return;
+FERRAMENTAS DISPONÍVEIS (use sempre que fizer sentido):
+1. criar_paciente — quando for um lead novo com nome identificado
+2. mover_estagio_pipeline — quando houver mudança clara (Novo Lead → Contato Feito → Agendado → Ativo → Alta)
+3. agendar_consulta — SOMENTE quando paciente confirmar data, hora e profissional específicos
+4. registrar_nota — para informações importantes (preferências, observações relevantes)
+5. marcar_perdido — quando paciente desistir claramente
+6. transferir_para_humano — para urgências médicas ou quando pedir humano
+
+FLUXO IDEAL:
+1. Primeira mensagem → pergunte nome → use criar_paciente → mova para "Contato Feito"
+2. Interesse em agendar → colete data/hora/profissional/modalidade → use agendar_consulta (move auto para "Agendado")
+3. Urgência médica → use transferir_para_humano(urgente=true)
+4. Execute tools em silêncio e depois responda ao paciente naturalmente.${contextoPaciente}`;
+
+  // Loop de tool use (permite múltiplas chamadas em sequência)
+  let textoResposta = '';
+  let tentativas = 0;
+  const MAX_TENTATIVAS = 5;
+
+  try {
+    while(tentativas < MAX_TENTATIVAS){
+      tentativas++;
+
+      const resp = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': key,
+          'anthropic-version': '2023-06-01',
+          'anthropic-dangerous-direct-browser-access': 'true'
+        },
+        body: JSON.stringify({
+          model: modelo,
+          max_tokens: 1000,
+          temperature: temperatura,
+          system: systemPrompt,
+          tools: _AGENTE_TOOLS,
+          messages: _waConvHistory[chatId].slice(-20)
+        })
+      });
+
+      if(!resp.ok){
+        const err = await resp.json();
+        console.error('[Agente IA] Erro Claude:', err);
+        break;
+      }
+
+      const data = await resp.json();
+
+      // Adiciona a resposta do assistant ao histórico
+      _waConvHistory[chatId].push({ role:'assistant', content: data.content });
+
+      // Verifica se o modelo pediu para usar uma tool
+      if(data.stop_reason === 'tool_use'){
+        const toolUses = data.content.filter(b => b.type === 'tool_use');
+        const toolResults = [];
+        for(const tu of toolUses){
+          console.log('[Tool] Executando:', tu.name, tu.input);
+          const resultado = await _agenteExecutarTool(tu.name, tu.input, chatId);
+          toolResults.push({
+            type: 'tool_result',
+            tool_use_id: tu.id,
+            content: JSON.stringify(resultado),
+          });
+        }
+        // Envia o resultado de volta para o modelo continuar
+        _waConvHistory[chatId].push({ role:'user', content: toolResults });
+        continue; // vai para próxima iteração
+      }
+
+      // Chegou ao final — extrai texto
+      const blocoTexto = data.content.find(b => b.type === 'text');
+      textoResposta = blocoTexto?.text || '';
+      break;
     }
 
-    const data = await resp.json();
-    const resposta = data.content?.[0]?.text;
-    if(!resposta){ _waAgentBusy[chatId] = false; return; }
-
-    // Adiciona ao histórico
-    _waConvHistory[chatId].push({ role:'assistant', content: resposta });
+    if(!textoResposta){ _waAgentBusy[chatId] = false; return; }
 
     // Pequena pausa (simula digitação natural)
     await new Promise(r => setTimeout(r, 800 + Math.random()*700));
 
     // Envia pelo WhatsApp
-    await _waEnviarRespostaAgente(chatId, resposta);
+    await _waEnviarRespostaAgente(chatId, textoResposta);
 
   } catch(e){
     console.error('[Agente IA] Erro:', e);
