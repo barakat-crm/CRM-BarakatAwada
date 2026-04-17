@@ -2809,7 +2809,7 @@ function isoDate(d) {
 
 let agendaEventos = [];
 let currentWeekStart = getMondayOf(new Date());
-let activeFilters = {v:true, i:true};
+let activeFilters = {a:true, j:true, s:true};
 
 function buildWeekView() {
   const header = document.getElementById('cal-header');
@@ -2886,11 +2886,13 @@ function buildWeekView() {
     const end = fim.getHours() + fim.getMinutes()/60;
 
     const pr = ev.profissionais || {};
-    const doc = (pr.inicial || 'V').toLowerCase();
+    const doc = (pr.inicial || 'A').toLowerCase();
     if(!activeFilters[doc]) return;
 
-    const color     = doc === 'v' ? '#2d5a4e' : '#8b5e3c';
-    const bgColor   = doc === 'v' ? '#e8f4f0' : '#f5ede6';
+    const corPorDoc = { a:'#1a5276', j:'#6c3483', s:'#b9770e' };
+    const bgPorDoc  = { a:'#d4e6f1', j:'#e8daef', s:'#fdebd0' };
+    const color     = corPorDoc[doc] || '#1a5276';
+    const bgColor   = bgPorDoc[doc] || '#d4e6f1';
     const statusCancelado = ev.status === 'cancelada';
 
     const hourRow  = Math.floor(ini) - HOURS_START;
@@ -2957,7 +2959,8 @@ function toggleFilter(doc) {
   const el = document.getElementById('filter-' + doc);
   if (activeFilters[doc]) {
     el.style.opacity = '1';
-    el.style.background = doc === 'v' ? 'var(--accent-light)' : 'var(--accent2-light)';
+    const bgPorDoc = { a:'#d4e6f1', j:'#e8daef', s:'#fdebd0' };
+    el.style.background = bgPorDoc[doc] || 'var(--accent-light)';
   } else {
     el.style.opacity = '0.4';
     el.style.background = 'var(--surface2)';
@@ -3988,7 +3991,7 @@ async function carregarPipelineClinoco(){
 
     col.innerHTML = lista.map(p => {
       const pr       = p.profissionais || {};
-      const tagClass = pr.inicial === 'V' ? 'tag-v' : 'tag-i';
+      const tagClass = pr.inicial === 'A' ? 'tag-v' : pr.inicial === 'J' ? 'tag-i' : 'tag-s';
       const modalidade = getModalidadePaciente(p.id);
       const modalBadge = modalidade === 'online'
         ? '<span class="badge-online">💻 Online</span>'
