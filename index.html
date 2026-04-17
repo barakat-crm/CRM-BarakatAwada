@@ -2032,19 +2032,36 @@ async function _waPollingCheck(){
         if(msgs.length !== ultimaTela) _waRenderMensagens(msgs, area);
       }
       // ── Detecta nova mensagem do paciente para acionar agente ──
-      if(msgs.length){
+      // IMPORTANTE: se Agente Global está LIGADO, NÃO dispara daqui (deixa o polling global cuidar
+      // pra evitar race condition com _waGlobalPollingCheck)
+      if(msgs.length && !_waAgentGlobal){
         const ultima = msgs[msgs.length - 1];
         const tsUltima = ultima.messageTimestamp || ultima.ts || 0;
         const tsSalvo  = _waLastMsgTs[chatId] || 0;
         // Nova mensagem recebida (não enviada por nós) e mais recente que a última salva
         if(!ultima.fromMe && tsUltima > tsSalvo && tsSalvo > 0){
-          // Usa lógica centralizada: global ON + não pausado, OU individual ON
-          if(_waAgenteAtivoParaChat(chatId)){
-            const multimodalContent = await _extrairConteudoMsg(ultima);
-            if(multimodalContent) _autoResponderWA(chatId, multimodalContent, msgs);
+          // Usa lógica centralizada: agente individual ON
+          if(_waAgenteAtivoParaChat(chatId) && !_waAgentBusy[chatId]){
+            // DEDUPE por msgId (mesma proteção do polling global)
+            const msgId = ultima.messageid || ultima.id || `${chatId}-${tsUltima}`;
+            if(!_waMsgsRespondidas.has(msgId)){
+              const multimodalContent = await _extrairConteudoMsg(ultima);
+              if(multimodalContent && !(typeof multimodalContent === 'object' && multimodalContent.__retryLater)){
+                // Trava síncrona + marca msgId
+                _waAgentBusy[chatId] = true;
+                _waMsgsRespondidas.add(msgId);
+                _autoResponderWA(chatId, multimodalContent, msgs);
+              }
+            }
           }
         }
         // Atualiza o timestamp da última msg vista
+        if(tsUltima > tsSalvo) _waLastMsgTs[chatId] = tsUltima;
+      } else if(msgs.length){
+        // Agente global ligado — só atualiza timestamp, não dispara (global cuida)
+        const ultima = msgs[msgs.length - 1];
+        const tsUltima = ultima.messageTimestamp || ultima.ts || 0;
+        const tsSalvo  = _waLastMsgTs[chatId] || 0;
         if(tsUltima > tsSalvo) _waLastMsgTs[chatId] = tsUltima;
       }
     }
