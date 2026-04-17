@@ -1904,7 +1904,7 @@ async function carregarMensagensWA(chatId){
     // Inicializa o timestamp da última mensagem (para o agente só responder mensagens NOVAS)
     if(msgs.length && !_waLastMsgTs[chatId]){
       const ultima = msgs[msgs.length-1];
-      _waLastMsgTs[chatId] = ultima.messageTimestamp || ultima.ts || Math.floor(Date.now()/1000);
+      _waLastMsgTs[chatId] = ultima.messageTimestamp || ultima.ts || Date.now();
     }
     // Atualiza visual do botão de agente deste chat
     setTimeout(_waAtualizarBtnAgenteChat, 50);
@@ -2013,7 +2013,7 @@ function toggleAgenteGlobal(){
   if(_waAgentGlobal){
     // Marca timestamp atual em todos os chats carregados (só responde msgs FUTURAS)
     _waChatsCache.forEach(c => {
-      if(!_waLastMsgTs[c.id]) _waLastMsgTs[c.id] = Math.floor(Date.now()/1000);
+      if(!_waLastMsgTs[c.id]) _waLastMsgTs[c.id] = Date.now();
     });
     // Inicia polling global a cada 15 segundos
     clearInterval(_waGlobalTimer);
@@ -2077,7 +2077,7 @@ function toggleAgenteWA(chatId){
     // Estava OFF/pausado → liga individualmente
     _waAgentChats[chatId] = true;
     // Marca timestamp baseline para não responder msgs antigas
-    _waLastMsgTs[chatId] = Math.floor(Date.now()/1000);
+    _waLastMsgTs[chatId] = Date.now();
     _waConvHistory[chatId] = _waGetHistoryFromDOM();
     toast('✦ Agente IA ativado nesta conversa!');
   }
@@ -2110,8 +2110,9 @@ async function _waGlobalPollingCheck(){
       if(_waAgentBusy[chatId]) continue;
 
       // Timestamp da última mensagem do chat (campo varia na API)
-      const tsChat = chat.lastMessage?.messageTimestamp || chat.wa_messageTimestamp
-                   || chat.messageTimestamp || chat.lastMessageTimestamp || 0;
+      const tsChat = chat.wa_lastMsgTimestamp || chat.lastMessage?.messageTimestamp
+                   || chat.wa_messageTimestamp || chat.messageTimestamp
+                   || chat.lastMessageTimestamp || 0;
       const tsSalvo = _waLastMsgTs[chatId] || 0;
 
       // Só processa se há mensagem mais recente que a última vista
