@@ -2228,6 +2228,13 @@ async function _waGlobalPollingCheck(){
       const multimodalContent = await _extrairConteudoMsg(ultima);
       if(!multimodalContent) { _waLastMsgTs[chatId] = tsUltima; continue; }
 
+      // Se extrator pediu retry (ex: áudio ainda processando), NÃO marca como respondido
+      if(multimodalContent && typeof multimodalContent === 'object' && multimodalContent.__retryLater){
+        console.log('[Polling] Áudio ainda processando. Retry no próximo ciclo.');
+        // NÃO atualiza tsSalvo — próximo polling tenta de novo
+        continue;
+      }
+
       // DEDUPE: nunca responder a mesma mensagem 2 vezes
       const msgId = ultima.messageid || ultima.id || `${chatId}-${tsUltima}`;
       if(_waMsgsRespondidas.has(msgId)){
@@ -2813,36 +2820,52 @@ async function transcreverAudioWhisper(audioBlob, mimeType){
 }
 
 async function _waBaixarMidiaUAZAPI(msgObj){
-  // UAZAPI já converte o áudio/imagem e disponibiliza em fileURL (ex: .../files/xxx.mp3)
-  // Essa é a forma mais simples e confiável de baixar mídia.
+  // UAZAPI processa o áudio/imagem assincronamente e disponibiliza via fileURL (.mp3 / .jpg)
+  // Se fileURL ainda não estiver pronto, tenta refetch da mensagem (pode ter demorado p/ processar)
   try {
-    // 1) fileURL direto (preferencial — UAZAPI já descriptografou e hospedou)
-    const fileURL = msgObj.fileURL;
-    if(fileURL){
-      const r = await fetch(fileURL);
-      if(r.ok){
-        const blob = await r.blob();
-        console.log('[Mídia] Baixada via fileURL:', fileURL, 'size:', blob.size);
-        return blob;
-      }
-      console.warn('[Mídia] fileURL não ok:', r.status, fileURL);
-    }
-    // 2) content.URL (WhatsApp criptografado — normalmente não funciona sem mediaKey)
-    const contentURL = msgObj.content?.URL || msgObj.content?.url;
-    if(contentURL){
-      try {
-        const r = await fetch(contentURL);
-        if(r.ok){
-          const blob = await r.blob();
-          if(blob.size > 100){
-            console.log('[Mídia] Baixada via content.URL');
-            return blob;
-          }
+    let fileURL = msgObj.fileURL;
+
+    // Se fileURL vazio, tenta refetch (UAZAPI pode ter demorado pra converter)
+    if(!fileURL){
+      const url = _waApiUrl();
+      const tok = _waApiToken();
+      const msgId = msgObj.messageid || msgObj.id;
+      if(url && tok && msgId){
+        for(let tentativa = 1; tentativa <= 3; tentativa++){
+          await new Promise(r => setTimeout(r, 2000 * tentativa)); // 2s, 4s, 6s
+          try {
+            const chatid = msgObj.chatid || msgObj.chatId;
+            const rm = await fetch(`${url}/message/find`, {
+              method:'POST', headers:{'Content-Type':'application/json','token':tok},
+              body: JSON.stringify({ chatId: chatid, limit: 5 })
+            });
+            if(rm.ok){
+              const dm = await rm.json();
+              const found = (dm.messages||[]).find(m => (m.messageid||m.id) === msgId);
+              if(found?.fileURL){
+                fileURL = found.fileURL;
+                console.log(`[Mídia] fileURL disponível após ${tentativa} tentativa(s)`);
+                break;
+              }
+            }
+          } catch(e){ /* ignora e tenta de novo */ }
         }
-      } catch(e){ /* CORS/criptografado — ignora */ }
+      }
     }
-    console.warn('[Mídia] Não foi possível baixar. Msg:', msgObj.messageType, 'fileURL:', fileURL);
-    return null;
+
+    if(!fileURL){
+      console.warn('[Mídia] fileURL não disponível para:', msgObj.messageType, msgObj.messageid);
+      return null;
+    }
+
+    const r = await fetch(fileURL);
+    if(!r.ok){
+      console.warn('[Mídia] fileURL retornou', r.status);
+      return null;
+    }
+    const blob = await r.blob();
+    console.log('[Mídia] Baixada via fileURL:', fileURL, 'size:', blob.size, 'type:', blob.type);
+    return blob;
   } catch(e){
     console.error('[Mídia] Erro ao baixar:', e);
     return null;
@@ -2876,17 +2899,27 @@ async function _extrairConteudoMsg(msgObj){
   if(temAudio && getWhisperEnabled()){
     try {
       const blob = await _waBaixarMidiaUAZAPI(msgObj);
-      if(!blob) return texto || null;
+      if(!blob){
+        // fileURL ainda não pronto — retorna EXTRAIR_LATER para o polling retentar
+        console.warn('[Áudio] fileURL não pronto. Retentando no próximo polling.');
+        return { __retryLater: true };
+      }
       const transcricao = await transcreverAudioWhisper(blob, blob.type);
       if(transcricao){
         toast(`🎤 Áudio transcrito (${transcricao.length} chars)`);
         return `[Áudio do paciente transcrito]: ${transcricao}${texto ? '\n(legenda: '+texto+')' : ''}`;
       }
+      // Transcrição vazia — retry
+      return { __retryLater: true };
     } catch(e){
       console.error('[Whisper] erro:', e);
-      toast('⚠️ Erro ao transcrever áudio: ' + e.message, 'erro');
+      // Se erro for de formato, não retenta (já é definitivo); senão retenta
+      if(/format|decode/i.test(e.message)){
+        toast('⚠️ Áudio em formato não suportado', 'erro');
+        return texto || '[Paciente enviou áudio em formato não suportado]';
+      }
+      return { __retryLater: true };
     }
-    return texto || '[Paciente enviou áudio — não foi possível transcrever]';
   }
 
   // IMAGEM — envia como content block multimodal
