@@ -1836,6 +1836,43 @@ let _waGlobalTimer   = null;  // intervalo de polling global (verifica todos os 
 function _waApiUrl(){ return getUazapiUrl(); }
 function _waApiToken(){ return getUazapiRealToken() || getUazapiInstance(); }
 
+// HELPER: converte o chatId interno (rff628...) para o chatid que a UAZAPI filtra
+// A UAZAPI IGNORA "chatId" (camelCase) e só respeita "chatid" (minúsculo) no formato phone@s.whatsapp.net
+function _waChatIdParaFiltro(chatId){
+  const chat = _waChatsCache?.find(c => c.id === chatId);
+  if(chat?.wa_chatid) return chat.wa_chatid;
+  const phone = (chat?.phone || '').replace(/\D/g,'');
+  if(phone) return `${phone}@s.whatsapp.net`;
+  return null;
+}
+
+// HELPER: busca mensagens GARANTINDO que são do chat correto
+// (UAZAPI tem bug onde retorna msgs de outros chats se o filtro estiver errado)
+async function _waFetchMensagensSeguro(chatId, limit){
+  const url = _waApiUrl(); const tok = _waApiToken();
+  const waChatid = _waChatIdParaFiltro(chatId);
+  if(!url || !tok || !waChatid) return null;
+  try {
+    const r = await fetch(`${url}/message/find`, {
+      method:'POST',
+      headers:{'Content-Type':'application/json','token':tok},
+      body: JSON.stringify({ chatid: waChatid, limit: limit || 20 })
+    });
+    if(!r.ok) return null;
+    const data = await r.json();
+    const msgs = (data.messages || []);
+    // VALIDAÇÃO: todas as msgs devem ter o chatid correto
+    const validas = msgs.filter(m => m.chatid === waChatid);
+    if(validas.length !== msgs.length){
+      console.warn(`[UAZAPI] Filtrou ${msgs.length - validas.length} msgs de outros chats!`);
+    }
+    return validas;
+  } catch(e){
+    console.error('[UAZAPI] erro em _waFetchMensagensSeguro:', e);
+    return null;
+  }
+}
+
 function _waTsFmt(ts){
   if(!ts) return '';
   const d = new Date(ts > 9999999999 ? ts : ts * 1000);
@@ -1949,14 +1986,12 @@ async function abrirChatWA(chatId){
 }
 
 async function carregarMensagensWA(chatId){
-  const url = _waApiUrl(); const tok = _waApiToken();
   const area = document.getElementById('wa-msgs-area');
   if(!area) return;
   try {
-    const r = await fetch(`${url}/message/find`, { method:'POST', headers:{'Content-Type':'application/json','token':tok}, body:JSON.stringify({chatId, limit:50}) });
-    if(!r.ok) throw new Error(`HTTP ${r.status}`);
-    const data = await r.json();
-    const msgs = (data.messages || []).reverse(); // mais antigas primeiro
+    const msgsArr = await _waFetchMensagensSeguro(chatId, 50);
+    if(msgsArr === null) throw new Error('Falha ao buscar mensagens');
+    const msgs = msgsArr.slice().reverse(); // mais antigas primeiro
     _waRenderMensagens(msgs, area);
     // Inicializa o timestamp da última mensagem (para o agente só responder mensagens NOVAS)
     if(msgs.length && !_waLastMsgTs[chatId]){
@@ -2023,10 +2058,9 @@ async function _waPollingCheck(){
   if(!url || !tok) return;
   try {
     const chatId = _waCurrentChat.id;
-    const r = await fetch(`${url}/message/find`, { method:'POST', headers:{'Content-Type':'application/json','token':tok}, body:JSON.stringify({chatId, limit:20}) });
-    if(r.ok){
-      const data = await r.json();
-      const msgs = (data.messages||[]).reverse();
+    const msgsArr = await _waFetchMensagensSeguro(chatId, 20);
+    if(msgsArr !== null){
+      const msgs = msgsArr.slice().reverse();
       const area = document.getElementById('wa-msgs-area');
       if(area && msgs.length){
         const ultimaTela = area.querySelectorAll('.wa-msg:not([data-polling])').length;
@@ -2229,16 +2263,10 @@ async function _waGlobalPollingCheck(){
       const tolerancia = 60 * 1000; // 60 segundos em ms
       if(tsChat > 0 && tsChat + tolerancia < tsSalvo) continue;
 
-      // Busca as últimas mensagens deste chat
-      const rm = await fetch(`${url}/message/find`, {
-        method:'POST',
-        headers:{'Content-Type':'application/json','token':tok},
-        body: JSON.stringify({chatId, limit:10})
-      });
-      if(!rm.ok) continue;
-      const dm = await rm.json();
-      const msgs = (dm.messages||[]).reverse();
-      if(!msgs.length) continue;
+      // Busca as últimas mensagens DESTE chat (usando chatid correto, não chatId camelCase)
+      const msgsArr = await _waFetchMensagensSeguro(chatId, 10);
+      if(!msgsArr || !msgsArr.length) continue;
+      const msgs = msgsArr.slice().reverse();
 
       const ultima = msgs[msgs.length-1];
       const tsUltima = ultima.messageTimestamp || ultima.ts || 0;
