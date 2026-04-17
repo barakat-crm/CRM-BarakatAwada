@@ -2201,8 +2201,10 @@ async function _waGlobalPollingCheck(){
                    || chat.lastMessageTimestamp || 0;
       const tsSalvo = _waLastMsgTs[chatId] || 0;
 
-      // Só processa se há mensagem mais recente que a última vista
-      if(tsChat <= tsSalvo) continue;
+      // Tolerância de 60s: se tsChat está até 60s antes do tsSalvo, ainda investiga
+      // (protege contra race entre reset/novo msg — dedupe por msgId cuida do resto)
+      const tolerancia = 60 * 1000; // 60 segundos em ms
+      if(tsChat > 0 && tsChat + tolerancia < tsSalvo) continue;
 
       // Busca as últimas mensagens deste chat
       const rm = await fetch(`${url}/message/find`, {
@@ -2217,8 +2219,9 @@ async function _waGlobalPollingCheck(){
 
       const ultima = msgs[msgs.length-1];
       const tsUltima = ultima.messageTimestamp || ultima.ts || 0;
-      if(ultima.fromMe || tsUltima <= tsSalvo) {
-        _waLastMsgTs[chatId] = tsUltima || tsChat;
+      // Só ignora se for MEU envio OU se estiver mais de 60s antes do baseline (aí é msg realmente antiga)
+      if(ultima.fromMe || (tsUltima > 0 && tsUltima + tolerancia < tsSalvo)) {
+        _waLastMsgTs[chatId] = Math.max(tsUltima || tsChat, tsSalvo);
         continue;
       }
 
