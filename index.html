@@ -2820,51 +2820,51 @@ async function transcreverAudioWhisper(audioBlob, mimeType){
 }
 
 async function _waBaixarMidiaUAZAPI(msgObj){
-  // UAZAPI processa o áudio/imagem assincronamente e disponibiliza via fileURL (.mp3 / .jpg)
-  // Se fileURL ainda não estiver pronto, tenta refetch da mensagem (pode ter demorado p/ processar)
+  // Estratégia:
+  // 1) Se fileURL já existe (UAZAPI já converteu), usa direto
+  // 2) Senão, chama POST /message/download com {id: messageid} — UAZAPI converte sob demanda
   try {
     let fileURL = msgObj.fileURL;
 
-    // Se fileURL vazio, tenta refetch (UAZAPI pode ter demorado pra converter)
     if(!fileURL){
       const url = _waApiUrl();
       const tok = _waApiToken();
       const msgId = msgObj.messageid || msgObj.id;
-      if(url && tok && msgId){
-        for(let tentativa = 1; tentativa <= 3; tentativa++){
-          await new Promise(r => setTimeout(r, 2000 * tentativa)); // 2s, 4s, 6s
-          try {
-            const chatid = msgObj.chatid || msgObj.chatId;
-            const rm = await fetch(`${url}/message/find`, {
-              method:'POST', headers:{'Content-Type':'application/json','token':tok},
-              body: JSON.stringify({ chatId: chatid, limit: 5 })
-            });
-            if(rm.ok){
-              const dm = await rm.json();
-              const found = (dm.messages||[]).find(m => (m.messageid||m.id) === msgId);
-              if(found?.fileURL){
-                fileURL = found.fileURL;
-                console.log(`[Mídia] fileURL disponível após ${tentativa} tentativa(s)`);
-                break;
-              }
-            }
-          } catch(e){ /* ignora e tenta de novo */ }
+      if(!url || !tok || !msgId){
+        console.warn('[Mídia] faltam url/token/id');
+        return null;
+      }
+      // Chama /message/download para forçar conversão + obter fileURL
+      try {
+        const r = await fetch(`${url}/message/download`, {
+          method:'POST',
+          headers:{'Content-Type':'application/json','token':tok},
+          body: JSON.stringify({ id: msgId })
+        });
+        if(r.ok){
+          const data = await r.json();
+          fileURL = data.fileURL || data.url;
+          console.log('[Mídia] /message/download OK — fileURL:', fileURL, data.cached ? '(cached)' : '(convertido agora)');
+        } else {
+          console.warn('[Mídia] /message/download falhou:', r.status);
         }
+      } catch(e){
+        console.warn('[Mídia] erro no /message/download:', e.message);
       }
     }
 
     if(!fileURL){
-      console.warn('[Mídia] fileURL não disponível para:', msgObj.messageType, msgObj.messageid);
+      console.warn('[Mídia] fileURL indisponível. Tipo:', msgObj.messageType, 'id:', msgObj.messageid);
       return null;
     }
 
     const r = await fetch(fileURL);
     if(!r.ok){
-      console.warn('[Mídia] fileURL retornou', r.status);
+      console.warn('[Mídia] fetch fileURL retornou', r.status);
       return null;
     }
     const blob = await r.blob();
-    console.log('[Mídia] Baixada via fileURL:', fileURL, 'size:', blob.size, 'type:', blob.type);
+    console.log('[Mídia] ✅ Baixada:', blob.size, 'bytes', blob.type);
     return blob;
   } catch(e){
     console.error('[Mídia] Erro ao baixar:', e);
