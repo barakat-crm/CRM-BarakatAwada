@@ -2656,22 +2656,26 @@ ${pacienteExistente ? `🆔 Paciente ID: ${pacienteExistente.id}\n📊 Estágio:
     else if(!mapDiaSemana[nome].proximaSemana) mapDiaSemana[nome].proximaSemana = dw.toISOString().slice(0,10);
   }
 
-  const systemPromptBase = promptCustom ||
-    `Você é ${nomeAgente}, secretária virtual da Clínica Barakat Awada, especializada em Urologia e Clínica Geral.
-
-EQUIPE MÉDICA:
+  // Regras críticas SEMPRE injetadas (mesmo que haja promptCustom)
+  const regrasCriticasClinica = `
+EQUIPE MÉDICA da Clínica Barakat Awada (Urologia & Clínica Geral):
 - Dr. Ali Mohamed — Urologista
 - Dra. Jamile Barakat — Urologista
 - Dra. Soraia Barakat — Clínica Geral
 
-REGRAS:
+🔒 REGRA DE IDENTIDADE (TOP PRIORIDADE): Cada conversa no WhatsApp está amarrada a UM telefone único. O "IDENTIDADE DESTA CONVERSA" abaixo diz o nome da pessoa com quem você está falando AGORA. Use SOMENTE esse nome — NUNCA invente, NUNCA misture com nomes de outras conversas ou outros pacientes. Se você "sentir vontade" de escrever "Camilo", "Vicente" ou qualquer outro nome que não esteja especificado na IDENTIDADE abaixo, PARE e use o nome correto.`;
+
+  const systemPromptBase = (promptCustom
+    ? promptCustom + '\n\n' + regrasCriticasClinica
+    : `Você é ${nomeAgente}, secretária virtual da Clínica Barakat Awada, especializada em Urologia e Clínica Geral.
+${regrasCriticasClinica}
+
+REGRAS GERAIS:
 - Seja acolhedora, empática e profissional
 - Responda de forma curta e direta (máximo 2 parágrafos)
 - NUNCA dê diagnósticos, prescrições ou orientações médicas
 - Horário de atendimento: segunda a sexta, 8h às 18h
-- Aceita particular e convênios
-
-🔒 REGRA DE IDENTIDADE (TOP PRIORIDADE): Cada conversa no WhatsApp está amarrada a UM telefone único. O "IDENTIDADE DESTA CONVERSA" abaixo diz o nome da pessoa com quem você está falando AGORA. Use SOMENTE esse nome — NUNCA misture com nomes de outras conversas.`;
+- Aceita particular e convênios`);
 
   const systemPrompt = systemPromptBase + `
 
@@ -2822,21 +2826,38 @@ REGRAS DE AGENDAMENTO:
       const primeiroNomeCerto = nomeDefinitivo.split(' ')[0].toLowerCase();
       // Busca outros pacientes do banco para comparar
       const { data: outrosPac } = await sb.from('pacientes')
-        .select('nome').neq('telefone', telefoneChat).neq('whatsapp', telefoneChat).limit(50);
-      const outrosNomes = (outrosPac||[]).map(p => (p.nome||'').split(' ')[0].toLowerCase()).filter(n => n && n !== primeiroNomeCerto && n.length >= 3);
-      // Regex: saudações seguidas de nome (Olá/Oi/Prazer X,  X!)
-      const regexNomeUsado = /(?:olá|oi|prazer|obrigad[oa]|de nada|pronto|perfeito|entendi|claro|ok),?\s+([A-ZÀ-Ý][a-zà-ÿ]{2,})/gi;
+        .select('nome').neq('telefone', telefoneChat).neq('whatsapp', telefoneChat).limit(200);
+      const outrosNomes = new Set((outrosPac||[])
+        .map(p => (p.nome||'').split(' ')[0].toLowerCase().trim())
+        .filter(n => n && n !== primeiroNomeCerto && n.length >= 3));
+
+      // Nomes dos profissionais (whitelist — não são "alucinação")
+      const profissionais = new Set(['ali','jamile','soraia','mohamed','barakat','ana']);
+
+      // Procura TODOS os nomes próprios (palavras capitalizadas) no texto
+      // Inclui "olá X", "oi X", "Ótimo X", "X!", "X," etc.
+      const regexNomesProprios = /\b([A-ZÀ-Ý][a-zà-ÿ]{2,})\b/g;
       let alucinacao = null;
-      for(const match of textoResposta.matchAll(regexNomeUsado)){
+      for(const match of textoResposta.matchAll(regexNomesProprios)){
         const nomeUsado = match[1].toLowerCase();
-        if(nomeUsado !== primeiroNomeCerto && outrosNomes.includes(nomeUsado)){
+        // Pula se for:
+        // - o nome correto
+        // - um profissional da clínica
+        // - início de frase (primeira palavra após ponto ou início)
+        if(nomeUsado === primeiroNomeCerto) continue;
+        if(profissionais.has(nomeUsado)) continue;
+        // Verifica se está em início de frase (não conta como alucinação)
+        const idx = match.index;
+        const antes = textoResposta.substring(Math.max(0,idx-3), idx);
+        if(idx === 0 || /[.!?\n]\s*$/.test(antes)) continue;
+        // Se o nome está na lista de outros pacientes → é alucinação
+        if(outrosNomes.has(nomeUsado)){
           alucinacao = match[1];
           break;
         }
       }
       if(alucinacao){
         console.warn(`[Guard-rail] Agente alucinou nome "${alucinacao}" mas a pessoa é "${nomeDefinitivo}". Corrigindo...`);
-        // Substitui o nome errado pelo certo
         const regex = new RegExp('\\b'+alucinacao+'\\b','gi');
         textoResposta = textoResposta.replace(regex, nomeDefinitivo.split(' ')[0]);
         toast(`⚠️ Agente confundiu nome (${alucinacao} → ${nomeDefinitivo.split(' ')[0]}) — corrigido`, 'erro');
