@@ -2397,6 +2397,13 @@ async function _agenteExecutarTool(nomeTool, args, chatId){
       const duracao = args.duracao_minutos || 30;
       const inicio = new Date(`${args.data}T${args.hora}:00`);
       const fim = new Date(inicio.getTime() + duracao*60000);
+      // VALIDAÇÃO: data no passado
+      const agora = new Date();
+      if(isNaN(inicio.getTime())) return { ok:false, mensagem:`Data "${args.data}" ou hora "${args.hora}" inválida. Use formato YYYY-MM-DD e HH:MM.` };
+      if(inicio < agora) return { ok:false, mensagem:`ERRO: A data ${args.data} já passou! Hoje é ${agora.toISOString().slice(0,10)}. Agende SEMPRE uma data FUTURA. Confirme com o paciente o dia correto (provavelmente ele quis dizer este ano/mês corrente).` };
+      // VALIDAÇÃO: fim de semana
+      const dow = inicio.getDay();
+      if(dow === 0 || dow === 6) return { ok:false, mensagem:`ERRO: ${args.data} é um ${dow===0?'domingo':'sábado'}. A clínica não atende fim de semana (segunda a sexta).` };
       const { data, error } = await sb.from('consultas').insert([{
         paciente_id: paciente.id,
         profissional_id: profId,
@@ -2471,6 +2478,11 @@ async function _agenteExecutarTool(nomeTool, args, chatId){
     if(nomeTool === 'listar_horarios_disponiveis'){
       const profId = _agenteResolveProfissional(args.profissional);
       if(!profId) return { ok:false, mensagem:`Profissional "${args.profissional}" não encontrado.` };
+      // VALIDAÇÃO: data no passado
+      const hojeISO = new Date().toISOString().slice(0,10);
+      if(args.data < hojeISO){
+        return { ok:false, mensagem:`ERRO: ${args.data} já passou. Hoje é ${hojeISO}. Pergunte ao paciente o dia correto e use uma data futura.` };
+      }
       const ini = `${args.data}T00:00:00`;
       const fim = `${args.data}T23:59:59`;
       const { data: ocupados } = await sb.from('consultas')
@@ -2580,13 +2592,29 @@ async function _autoResponderWA(chatId, textoRecebido, allMsgs){
   // Contexto: paciente já existe?
   const pacienteExistente = await _agenteGetPacienteByChat(chatId);
   const contextoPaciente = pacienteExistente
-    ? `\n\nCONTEXTO: Paciente já cadastrado — ${pacienteExistente.nome} ${pacienteExistente.sobrenome}, estágio atual: ${pacienteExistente.estagio_pipeline}, status: ${pacienteExistente.status}. NÃO chame criar_paciente de novo.`
-    : `\n\nCONTEXTO: Paciente AINDA NÃO cadastrado. Se ele demonstrar interesse, use a tool criar_paciente logo na primeira oportunidade (peça o nome completo se não souber).`;
+    ? `\n\nCONTEXTO DO PACIENTE:\nEste WhatsApp pertence a ${pacienteExistente.nome} ${pacienteExistente.sobrenome}, já cadastrado no sistema (estágio: ${pacienteExistente.estagio_pipeline}, status: ${pacienteExistente.status}).\nTrate a pessoa como sendo ${pacienteExistente.nome} — NÃO questione a identidade dela, NÃO peça pra confirmar quem é. Se ela se apresentar com outro nome, apenas atualize o registro com registrar_nota.\nNÃO chame criar_paciente de novo.`
+    : `\n\nCONTEXTO DO PACIENTE:\nEste número AINDA NÃO está cadastrado. Se a pessoa demonstrar interesse em consulta, peça o nome completo e use criar_paciente.`;
 
-  // System prompt do agente
-  const hoje = new Date().toLocaleDateString('pt-BR',{weekday:'long',day:'2-digit',month:'long',year:'numeric'});
+  // System prompt do agente — data em múltiplos formatos pra evitar confusão
+  const agora = new Date();
+  const hoje = agora.toLocaleDateString('pt-BR',{weekday:'long',day:'2-digit',month:'long',year:'numeric'});
+  const hojeISO = agora.toISOString().slice(0,10);
+  const anoAtual = agora.getFullYear();
+  const mesAtual = agora.getMonth() + 1;
+  const diaAtual = agora.getDate();
+  // Calcula próximos dias úteis como referência
+  const proxDiasUteis = [];
+  let d = new Date(agora);
+  while(proxDiasUteis.length < 5){
+    d.setDate(d.getDate()+1);
+    const dow = d.getDay();
+    if(dow !== 0 && dow !== 6){
+      proxDiasUteis.push(`${d.toLocaleDateString('pt-BR',{weekday:'short',day:'2-digit',month:'2-digit'})} = ${d.toISOString().slice(0,10)}`);
+    }
+  }
+
   const systemPromptBase = promptCustom ||
-    `Você é ${nomeAgente}, secretária virtual da Clínica Barakat Awada, especializada em Urologia e Clínica Geral. Hoje é ${hoje}.
+    `Você é ${nomeAgente}, secretária virtual da Clínica Barakat Awada, especializada em Urologia e Clínica Geral.
 
 EQUIPE MÉDICA:
 - Dr. Ali Mohamed — Urologista
@@ -2602,27 +2630,42 @@ REGRAS:
 
   const systemPrompt = systemPromptBase + `
 
-FERRAMENTAS DISPONÍVEIS (use sempre que fizer sentido):
-1. criar_paciente — quando for um lead novo com nome identificado
-2. mover_estagio_pipeline — quando houver mudança clara (Novo Lead → Contato Feito → Agendado → Ativo → Alta)
+⚠️ DATA ATUAL (CRÍTICO — sempre use como referência):
+- Hoje é ${hoje}
+- Data ISO de hoje: ${hojeISO}
+- Ano corrente: ${anoAtual}
+- Mês corrente: ${String(mesAtual).padStart(2,'0')}
+- Dia corrente: ${String(diaAtual).padStart(2,'0')}
+
+Próximos dias úteis (use como referência quando o paciente falar "terça", "sexta", "próxima semana"):
+${proxDiasUteis.map(d => '- '+d).join('\n')}
+
+REGRAS DE DATA (NUNCA QUEBRE):
+1. TODA data que você usar nas tools DEVE ser >= ${hojeISO} (hoje ou no futuro).
+2. Se o paciente disser apenas "dia 22", "22/04", "na quinta" — considere o PRÓXIMO dia 22 futuro (este mês ou o próximo), NUNCA janeiro de 2025 ou anos anteriores.
+3. Se ele disser só o dia (ex: "dia 22"), assuma o mês e ano correntes (${String(mesAtual).padStart(2,'0')}/${anoAtual}).
+4. Se você estiver em dúvida da data exata, PERGUNTE ao paciente: "Você quer dizer quinta-feira, 23/04/${anoAtual}?"
+
+FERRAMENTAS DISPONÍVEIS:
+1. criar_paciente — para lead novo com nome identificado (não use se já há paciente cadastrado)
+2. mover_estagio_pipeline — para mudanças de estágio (Novo Lead → Contato Feito → Agendado → Ativo → Alta)
 3. consultar_agenda — para ver consultas já marcadas em um período
-4. listar_horarios_disponiveis — SEMPRE use ANTES de propor horários (verifica vagas livres)
-5. agendar_consulta — SOMENTE quando paciente confirmar data, hora e profissional específicos
-6. registrar_nota — para informações importantes (preferências, observações relevantes)
+4. listar_horarios_disponiveis — SEMPRE use ANTES de propor horários
+5. agendar_consulta — SOMENTE quando paciente confirmar data+hora+profissional específicos
+6. registrar_nota — para informações importantes sobre o paciente
 7. marcar_perdido — quando paciente desistir claramente
 8. transferir_para_humano — para urgências médicas ou quando pedir humano
 
 FLUXO IDEAL:
-1. Primeira mensagem → pergunte nome → use criar_paciente → mova para "Contato Feito"
-2. Paciente quer agendar → use listar_horarios_disponiveis → ofereça opções → confirme com paciente → use agendar_consulta (move auto para "Agendado")
-3. Paciente pergunta o que tem na agenda dele → use consultar_agenda
-4. Urgência médica → use transferir_para_humano(urgente=true)
-5. Execute tools em silêncio e depois responda ao paciente naturalmente.
+1. Lead novo → pergunte nome → criar_paciente → mover_estagio_pipeline("Contato Feito")
+2. Quer agendar → listar_horarios_disponiveis → ofereça opções → confirme → agendar_consulta (move auto para "Agendado")
+3. Urgência médica → transferir_para_humano(urgente=true)
+4. Execute tools em silêncio e depois responda ao paciente naturalmente.
 
-REGRAS IMPORTANTES SOBRE AGENDAMENTO:
-- NUNCA invente um horário disponível. SEMPRE consulte primeiro com listar_horarios_disponiveis.
+REGRAS DE AGENDAMENTO:
+- NUNCA invente horários. SEMPRE consulte listar_horarios_disponiveis antes.
 - Cada consulta dura 30 minutos por padrão.
-- Atendimento: segunda a sexta, 8h às 18h. NÃO há atendimento em fins de semana.${contextoPaciente}`;
+- Atendimento: segunda a sexta, 8h às 18h. Sem atendimento em fim de semana.${contextoPaciente}`;
 
   // Loop de tool use (permite múltiplas chamadas em sequência)
   let textoResposta = '';
