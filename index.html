@@ -2602,15 +2602,25 @@ async function _autoResponderWA(chatId, textoRecebido, allMsgs){
   const anoAtual = agora.getFullYear();
   const mesAtual = agora.getMonth() + 1;
   const diaAtual = agora.getDate();
-  // Calcula próximos dias úteis como referência
+  // Calcula próximos dias úteis (10 dias) como referência
   const proxDiasUteis = [];
   let d = new Date(agora);
-  while(proxDiasUteis.length < 5){
+  while(proxDiasUteis.length < 10){
     d.setDate(d.getDate()+1);
     const dow = d.getDay();
     if(dow !== 0 && dow !== 6){
-      proxDiasUteis.push(`${d.toLocaleDateString('pt-BR',{weekday:'short',day:'2-digit',month:'2-digit'})} = ${d.toISOString().slice(0,10)}`);
+      proxDiasUteis.push(`${d.toLocaleDateString('pt-BR',{weekday:'long',day:'2-digit',month:'long'})} = ${d.toISOString().slice(0,10)}`);
     }
+  }
+  // Mapeamento semântico: dia da semana → data ISO
+  const mapDiaSemana = {};
+  const nomesSem = ['domingo','segunda','terça','quarta','quinta','sexta','sábado'];
+  let dw = new Date(agora);
+  for(let i=1; i<=14; i++){
+    dw.setDate(dw.getDate()+1);
+    const nome = nomesSem[dw.getDay()];
+    if(!mapDiaSemana[nome]) mapDiaSemana[nome] = { proxima: dw.toISOString().slice(0,10), proximaSemana: null };
+    else if(!mapDiaSemana[nome].proximaSemana) mapDiaSemana[nome].proximaSemana = dw.toISOString().slice(0,10);
   }
 
   const systemPromptBase = promptCustom ||
@@ -2637,14 +2647,34 @@ REGRAS:
 - Mês corrente: ${String(mesAtual).padStart(2,'0')}
 - Dia corrente: ${String(diaAtual).padStart(2,'0')}
 
-Próximos dias úteis (use como referência quando o paciente falar "terça", "sexta", "próxima semana"):
+📆 RESOLUÇÃO AUTOMÁTICA DE DIAS DA SEMANA:
+${Object.entries(mapDiaSemana).map(([nome, d]) => `- "${nome}"/"${nome}-feira" = ${d.proxima}  |  "próxima ${nome}" ou "${nome} da semana que vem" = ${d.proximaSemana || d.proxima}`).join('\n')}
+
+📆 PRÓXIMOS DIAS ÚTEIS (use como referência):
 ${proxDiasUteis.map(d => '- '+d).join('\n')}
 
-REGRAS DE DATA (NUNCA QUEBRE):
-1. TODA data que você usar nas tools DEVE ser >= ${hojeISO} (hoje ou no futuro).
-2. Se o paciente disser apenas "dia 22", "22/04", "na quinta" — considere o PRÓXIMO dia 22 futuro (este mês ou o próximo), NUNCA janeiro de 2025 ou anos anteriores.
-3. Se ele disser só o dia (ex: "dia 22"), assuma o mês e ano correntes (${String(mesAtual).padStart(2,'0')}/${anoAtual}).
-4. Se você estiver em dúvida da data exata, PERGUNTE ao paciente: "Você quer dizer quinta-feira, 23/04/${anoAtual}?"
+⚡ REGRAS DE DATA — VOCÊ DEVE RESOLVER AUTOMATICAMENTE, NUNCA PERGUNTAR AO PACIENTE SOBRE MÊS/ANO:
+
+1. "dia 22" / "22" (só o número) → use ${anoAtual}-${String(mesAtual).padStart(2,'0')}-22 se ainda não passou; senão próximo mês (${anoAtual}-${String(mesAtual+1).padStart(2,'0')}-22).
+2. "22/04" / "22 de abril" → use ${anoAtual}-04-22 (ano corrente ${anoAtual}, SEM EXCEÇÃO).
+3. "22/04/2026" → use 2026-04-22 (respeita o ano fornecido).
+4. "quinta-feira" / "na quinta" → pegue da tabela de RESOLUÇÃO AUTOMÁTICA acima.
+5. "próxima quinta" / "quinta que vem" → pegue da tabela (coluna "próxima").
+6. "amanhã" → ${new Date(Date.now()+86400000).toISOString().slice(0,10)}.
+7. "depois de amanhã" → ${new Date(Date.now()+2*86400000).toISOString().slice(0,10)}.
+8. "semana que vem" (sem dia específico) → pergunte qual dia da semana o paciente prefere.
+
+❌ NUNCA pergunte ao paciente:
+- "Qual mês?"
+- "Qual ano?"
+- "Em 2026?"
+- "Pode confirmar a data exata?"
+Essas perguntas são PROIBIDAS — você JÁ SABE, resolva sozinho.
+
+✅ EM VEZ DISSO, confirme a data resolvida ao chamar as tools.
+Exemplo: paciente diz "quero dia 22" → você resolve para ${anoAtual}-${String(mesAtual).padStart(2,'0')}-22 e responde "Vou agendar para quarta-feira, 22 de abril. Qual horário você prefere?"
+
+📌 TODA data usada nas tools DEVE estar no formato YYYY-MM-DD e DEVE ser >= ${hojeISO}.
 
 🛠️ VOCÊ TEM FERRAMENTAS PODEROSAS (USE-AS — nunca diga que não tem acesso):
 
