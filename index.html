@@ -1773,6 +1773,7 @@ let _waAgentChats    = {};   // chatId -> true=forçado ON | false=forçado OFF 
 let _waLastMsgTs     = {};   // chatId -> timestamp da última msg vista (para detectar novas)
 let _waConvHistory   = {};   // chatId -> [{role:'user'|'assistant', content}] histórico para o Claude
 let _waAgentBusy     = {};   // chatId -> true enquanto o agente está processando (evita duplas)
+let _waMsgsRespondidas = new Set();  // msgId -> já respondida (dedupe anti-race)
 let _waAgentGlobal   = false; // modo global: responde TODAS as conversas automaticamente
 let _waGlobalTimer   = null;  // intervalo de polling global (verifica todos os chats)
 
@@ -2169,6 +2170,23 @@ async function _waGlobalPollingCheck(){
       const textoMsg = ultima.content?.text || ultima.content?.caption || ultima.content?.conversation || '';
       if(!textoMsg) { _waLastMsgTs[chatId] = tsUltima; continue; }
 
+      // DEDUPE: nunca responder a mesma mensagem 2 vezes
+      const msgId = ultima.messageid || ultima.id || `${chatId}-${tsUltima}`;
+      if(_waMsgsRespondidas.has(msgId)){
+        // Já respondida — só atualiza timestamp e pula
+        _waLastMsgTs[chatId] = tsUltima;
+        continue;
+      }
+      // Trava SÍNCRONA antes de qualquer await (evita 2 execuções em paralelo)
+      if(_waAgentBusy[chatId]) continue;
+      _waAgentBusy[chatId] = true;  // trava IMEDIATA
+      _waMsgsRespondidas.add(msgId);
+      // Limpa cache de msgs respondidas quando ficar muito grande
+      if(_waMsgsRespondidas.size > 500){
+        const arr = Array.from(_waMsgsRespondidas);
+        _waMsgsRespondidas = new Set(arr.slice(-250));
+      }
+
       // Aciona o agente para este chat
       _waLastMsgTs[chatId] = tsUltima;
       _autoResponderWA(chatId, textoMsg, msgs);
@@ -2554,10 +2572,11 @@ async function _agenteExecutarTool(nomeTool, args, chatId){
 
 // ── Auto-Responder IA (com Tool Use) ──────────────────────────
 async function _autoResponderWA(chatId, textoRecebido, allMsgs){
-  if(_waAgentBusy[chatId]) return; // evita duplicata
+  // Nota: o polling já setou _waAgentBusy[chatId]=true de forma SÍNCRONA antes de nos chamar.
+  // Mas se for chamado por outro caminho (ex: abrir chat manualmente), garantimos aqui também.
+  if(!_waAgentBusy[chatId]) _waAgentBusy[chatId] = true;
   const key = getAnthropicKey();
-  if(!key) return;
-  _waAgentBusy[chatId] = true;
+  if(!key){ _waAgentBusy[chatId] = false; return; }
 
   // Monta histórico de conversa
   if(!_waConvHistory[chatId]) _waConvHistory[chatId] = [];
